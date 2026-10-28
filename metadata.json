@@ -1,0 +1,6 @@
+{
+  "name": "AegisLua - Roblox Luau Obfuscator Platform",
+  "description": "Enterprise-grade Roblox Lua and Luau source code obfuscation platform featuring AST transformation, compatibility profiles, AES-256-GCM encrypted recovery vault, and private security administration.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
