@@ -1,28 +1,9 @@
-/**
- * Luraph-Grade Luau Protection Suite
- * Provides advanced structural protection:
- * - Barcode identifier mangling (_IlIIllIlI)
- * - Anti-Hook & Anti-Metatable tamper inspection (Active utilization of _IlI_hooked sentinel)
- * - Anti-Decompiler CFG traps using mathematical invariants
- * - Global Access Registry Virtualization (decouples direct `game`, `task`, `workspace` references)
- * - Polymorphic number encoding
- * 
- * Security Disclosure:
- * In accordance with the fundamental computational limits of interpreted languages,
- * client-side obfuscation provides high-friction resistance against static decompilation
- * and automated pattern matching, but does not provide mathematical impossibility of memory dumping.
- */
-
-/**
- * Generates an indistinguishable barcode identifier (e.g. _IlIIlIllI, _lIlIIllI)
- */
 export function generateBarcodeIdentifier(index: number, seed: number = 0x5a3f): string {
   const chars = ['I', 'l', '1', 'I', 'l'];
   let hash = (index * 0x6d2b79f5) ^ seed;
-  const len = 7 + (Math.abs(hash) % 5); // 7 to 11 chars
+  const len = 8 + (Math.abs(hash) % 6);
   let res = '_';
   
-  // First char after underscore must be letter in Lua
   res += (Math.abs(hash) % 2 === 0) ? 'I' : 'l';
   
   for (let i = 1; i < len; i++) {
@@ -34,111 +15,115 @@ export function generateBarcodeIdentifier(index: number, seed: number = 0x5a3f):
   return `${res}_${index.toString(16)}`;
 }
 
-/**
- * Generates the Luraph-Grade Anti-Hook and Anti-Tamper Runtime Prelude.
- * Crucial Fixes:
- * 1. _IlI_hooked is actively consumed and recorded in security telemetry.
- * 2. Shields inspection with defensive pcall to prevent false positives in sandboxed Studio runtimes.
- * 3. Does not abruptly kill scripts without diagnostic notification.
- */
 export function getLuraphAntiTamperPrelude(options: { seed?: number; strictMode?: boolean } = {}): string {
-  const seed = options.seed || 0x1337;
-  const trapVal1 = (seed % 17) + 3;
+  const randTag = Math.random().toString(36).substring(2, 6);
+  const pcallVar = `_p_${randTag}`;
+  const typeVar = `_t_${randTag}`;
+  const hookedVar = `_hk_${randTag}`;
 
-  return `-- [AegisLua Security Core - Sentinel & Integrity Suite]
--- Notice: Protects against naive static decompilation. Client-side runtime execution is inspectable in memory.
-local _IlI_env = (type(getfenv) == "function" and getfenv()) or _G
-local _IlI_pcall = pcall
-local _IlI_type = type
-local _IlI_hooked = false
-local _IlI_hook_reason = nil
+  return `local ${pcallVar} = pcall
+local ${typeVar} = type
+local ${hookedVar} = false
 
--- Defensive Environment Integrity Verification
-_IlI_pcall(function()
-    if _IlI_type(_IlI_pcall) ~= "function" or _IlI_type(string) ~= "table" or _IlI_type(table) ~= "table" then
-        _IlI_hooked = true
-        _IlI_hook_reason = "Core library table structure tampered"
+${pcallVar}(function()
+    if ${typeVar}(${pcallVar}) ~= "function" or ${typeVar}(string) ~= "table" or ${typeVar}(table) ~= "table" then
+        ${hookedVar} = true
     end
 
-    -- Metamethod & Hook inspection with safe exception shielding
-    if debug and _IlI_type(debug) == "table" then
-        if _IlI_type(debug.getmetatable) == "function" then
-            local _ok, _strMeta = _IlI_pcall(debug.getmetatable, "")
-            if _ok and _strMeta and _IlI_type(_strMeta) == "table" and _strMeta.__index ~= string then
-                _IlI_hooked = true
-                _IlI_hook_reason = "String metatable __index hooked"
+    local _okStr, _strMeta = ${pcallVar}(getmetatable, "")
+    if _okStr and _strMeta and ${typeVar}(_strMeta) == "table" and _strMeta.__index ~= string then
+        ${hookedVar} = true
+    end
+
+    if debug and ${typeVar}(debug) == "table" then
+        if ${typeVar}(debug.gethook) == "function" then
+            local _okHook, _currentHook = ${pcallVar}(debug.gethook)
+            if _okHook and _currentHook ~= nil then
+                ${hookedVar} = true
             end
         end
 
-        if _IlI_type(debug.getinfo) == "function" then
-            local _ok, _info = _IlI_pcall(debug.getinfo, _IlI_pcall)
-            -- Only flag if explicitly hooked as a Lua closure in native Luau environments
+        if ${typeVar}(debug.getmetatable) == "function" then
+            local _ok, _meta = ${pcallVar}(debug.getmetatable, "")
+            if _ok and _meta and ${typeVar}(_meta) == "table" and _meta.__index ~= string then
+                ${hookedVar} = true
+            end
+        end
+
+        if ${typeVar}(debug.getinfo) == "function" then
+            local _ok, _info = ${pcallVar}(debug.getinfo, ${pcallVar})
             if _ok and _info and _info.what == "Lua" then
-                _IlI_hooked = true
-                _IlI_hook_reason = "pcall closure converted from C to Lua hook"
+                ${hookedVar} = true
+            end
+
+            local _okErr, _infoErr = ${pcallVar}(debug.getinfo, error)
+            if _okErr and _infoErr and _infoErr.what == "Lua" then
+                ${hookedVar} = true
             end
         end
     end
 end)
 
--- Active utilization of _IlI_hooked state (prevents dead/unused sentinel state)
-if _IlI_hooked then
-    if _IlI_env and _IlI_type(_IlI_env) == "table" then
-        _IlI_env["__AEGIS_SENTINEL_DETECTED"] = true
-        _IlI_env["__AEGIS_SENTINEL_REASON"] = _IlI_hook_reason or "Unknown environment anomaly"
-    end
-    if type(warn) == "function" then
-        warn("[AegisLua Security Notice] Environment anomaly detected: " .. tostring(_IlI_hook_reason or "Hook detected"))
-    end
-end
-
--- Anti-Decompiler Control-Flow Trap (Bypassed cleanly at runtime via mathematical invariant)
--- Invariant: n*(n+1) is provably even for all integers, so ((n*(n+1)) % 2 ~= 0) is false
-if (((${trapVal1} * (${trapVal1} + 1)) % 2) ~= 0) then
-    while true do
-        local _decoy = function() return _decoy end
-        _decoy()
-    end
+if ${hookedVar} then
+    error("", 0)
 end
 `;
 }
 
-/**
- * Generates the Global Access Virtualization Registry.
- * Intercepts references to standard Roblox globals (game, workspace, task, script, print, Vector3, tonumber, etc.)
- * and resolves them dynamically through an obfuscated environment lookup via constant pool IDs.
- */
-export function getGlobalRegistryVirtualizer(kAccessorName: string = '_0x_K'): { prelude: string; accessorName: string } {
-  const accessorName = `_0x_G`;
+export function getGlobalRegistryVirtualizer(
+  kAccessorName: string = '_k_01',
+  gAccessorName: string = '_g_01'
+): { prelude: string; accessorName: string } {
+  const accessorName = gAccessorName;
+  const randTag = Math.random().toString(36).substring(2, 6);
+  const cacheVar = `_c_${randTag}`;
+  const envVar = `_e_${randTag}`;
+  const proxyVar = `_prx_${randTag}`;
+  const idVar = `_id_${randTag}`;
+  const cachedVar = `_cd_${randTag}`;
+  const keyVar = `_k_${randTag}`;
+  const valVar = `_v_${randTag}`;
 
-  const prelude = `-- [AegisLua Global Access Registry Virtualizer]
-local ${accessorName} = function(_id)
-    local _g = ${kAccessorName}(_id)
-    if not _g or _g == "" then return nil end
-    local _env = (type(getfenv) == "function" and getfenv()) or _G
-    return (_env and _env[_g]) or (_G and _G[_g])
-end`;
+  const prelude = `local ${accessorName} = (function()
+    local ${cacheVar} = {}
+    local ${envVar} = (type(getfenv) == "function" and getfenv()) or (type(_G) == "table" and _G)
+    local ${proxyVar} = setmetatable({}, {
+        __index = function(_, _k)
+            if ${envVar} then return ${envVar}[_k] end
+            return nil
+        end
+    })
+    return function(${idVar})
+
+        local ${cachedVar} = ${cacheVar}[${idVar}]
+        if ${cachedVar} ~= nil then return ${cachedVar} end
+        local ${keyVar} = ${kAccessorName}(${idVar})
+        if not ${keyVar} or ${keyVar} == "" then return nil end
+        local ${valVar} = ${proxyVar}[${keyVar}]
+        ${cacheVar}[${idVar}] = ${valVar}
+        return ${valVar}
+    end
+end)()`;
 
   return { prelude, accessorName };
 }
 
-/**
- * Generates Luraph-grade polymorphic number encoding
- * Replaces integer literals with equivalent algebraic expressions
- */
+
+
 export function encodeNumberLuraph(n: number): string {
   if (isNaN(n) || !isFinite(n)) return String(n);
   if (n === 0) {
-    const k = Math.floor(Math.random() * 20) + 1;
-    return `(${k} - ${k})`;
+    const k = Math.floor(Math.random() * 20) + 5;
+    return `(0x${(k * 2).toString(16)} - 0x${(k * 2).toString(16)})`;
   }
   if (n === 1) {
-    const k = Math.floor(Math.random() * 20) + 2;
-    return `(${k} - ${k - 1})`;
+    const k = Math.floor(Math.random() * 20) + 5;
+    return `(0x${(k * 2 + 1).toString(16)} - 0x${(k * 2).toString(16)})`;
   }
   if (n > 1 && n <= 100) {
-    const offset = Math.floor(Math.random() * 30) + 5;
-    return `((${n + offset}) - ${offset})`;
+    const offset = 0x2b;
+    const total = n + offset;
+    return `(0x${total.toString(16)} - 0x${offset.toString(16)})`;
   }
   return String(n);
 }

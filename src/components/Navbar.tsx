@@ -66,17 +66,19 @@ export const Navbar: React.FC<NavbarProps> = ({
             History
           </button>
 
-          <button
-            onClick={() => setActiveTab('vault')}
-            className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
-              activeTab === 'vault'
-                ? 'bg-slate-800 text-cyan-400 font-semibold'
-                : 'text-slate-400 hover:text-slate-100 hover:bg-slate-900/60'
-            }`}
-          >
-            <Archive className="w-4 h-4" />
-            Recovery Vault
-          </button>
+          {isAdmin && (
+            <button
+              onClick={() => setActiveTab('vault')}
+              className={`px-3 py-1.5 rounded-md transition-colors whitespace-nowrap flex items-center gap-1.5 ${
+                activeTab === 'vault'
+                  ? 'bg-slate-800 text-cyan-400 font-semibold'
+                  : 'text-slate-400 hover:text-slate-100 hover:bg-slate-900/60'
+              }`}
+            >
+              <Archive className="w-4 h-4" />
+              Recovery Vault
+            </button>
+          )}
 
           <button
             onClick={() => setActiveTab('tests')}
@@ -163,12 +165,14 @@ export const Navbar: React.FC<NavbarProps> = ({
         >
           History
         </button>
-        <button
-          onClick={() => setActiveTab('vault')}
-          className={`px-2.5 py-1 rounded whitespace-nowrap ${activeTab === 'vault' ? 'bg-slate-800 text-cyan-400 font-semibold' : 'text-slate-400'}`}
-        >
-          Vault
-        </button>
+        {isAdmin && (
+          <button
+            onClick={() => setActiveTab('vault')}
+            className={`px-2.5 py-1 rounded whitespace-nowrap ${activeTab === 'vault' ? 'bg-slate-800 text-cyan-400 font-semibold' : 'text-slate-400'}`}
+          >
+            Vault
+          </button>
+        )}
         <button
           onClick={() => setActiveTab('tests')}
           className={`px-2.5 py-1 rounded whitespace-nowrap ${activeTab === 'tests' ? 'bg-slate-800 text-cyan-400 font-semibold' : 'text-slate-400'}`}

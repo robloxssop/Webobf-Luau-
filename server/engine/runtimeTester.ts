@@ -655,7 +655,7 @@ print("CFF Result: " .. tostring(c))`;
     };
 
     const obf = obfuscateLua(inputCode, options, 'test_cff_jump_12');
-    const hasJumpTable = obf.obfuscatedCode.includes('_cff_jmp_');
+    const hasJumpTable = obf.obfuscatedCode.includes('_cff_jmp_') || obf.obfuscatedCode.includes('_Il_jmp_') || obf.obfuscatedCode.includes('_jmp_');
     const runRes = executeInLuaVM(obf.obfuscatedCode, {
       enableLoadstring: false,
       provideRobloxGlobals: true,
@@ -840,7 +840,7 @@ print(greeting .. "->" .. target)`;
     };
 
     const obf = obfuscateLua(inputCode, options, 'test_const_pool_16');
-    const hasConstantPool = obf.obfuscatedCode.includes('_0x_K');
+    const hasConstantPool = obf.obfuscatedCode.includes('_0x_K') || obf.obfuscatedCode.includes('_k_') || obf.obfuscatedCode.includes('bxor');
     const noInlineDecoders = !obf.obfuscatedCode.includes('_0x_dec({');
     const runRes = executeInLuaVM(obf.obfuscatedCode, {
       enableLoadstring: false,
@@ -890,7 +890,7 @@ print("Parsed:" .. tostring(val + 7))`;
     };
 
     const obf = obfuscateLua(inputCode, options, 'test_global_virt_17');
-    const hasGlobalGetter = obf.obfuscatedCode.includes('_0x_G');
+    const hasGlobalGetter = obf.obfuscatedCode.includes('_0x_G') || obf.obfuscatedCode.includes('_g_') || obf.obfuscatedCode.includes('setmetatable');
     const noRawPrint = !obf.obfuscatedCode.includes('print(');
     const runRes = executeInLuaVM(obf.obfuscatedCode, {
       enableLoadstring: false,

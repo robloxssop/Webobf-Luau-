@@ -20,6 +20,15 @@ export default function App() {
   const [result, setResult] = useState<ObfuscationResult | null>(null);
   const [notification, setNotification] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
+  const isAdmin = currentUser?.role === 'admin' || currentUser?.role === 'superadmin';
+
+  // Guard: Automatically redirect non-admin users away from Recovery Vault
+  useEffect(() => {
+    if (activeTab === 'vault' && !isAdmin) {
+      setActiveTab('studio');
+    }
+  }, [activeTab, isAdmin]);
+
   // Check current session on mount, or auto-initialize standard developer demo session
   useEffect(() => {
     const checkOrInitSession = async () => {
@@ -246,7 +255,7 @@ export default function App() {
           <HistoryPanel onSelectJob={handleSelectJob} />
         )}
 
-        {activeTab === 'vault' && (
+        {activeTab === 'vault' && isAdmin && (
           <RecoveryVaultPanel />
         )}
 

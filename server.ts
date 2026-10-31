@@ -354,13 +354,18 @@ app.post('/api/obfuscate', optionalAuthOrGuest, (req: AuthenticatedRequest, res:
     mode: rawOptions.mode || 'direct_luau',
     stringEncoding: rawOptions.stringEncoding || 'byte_array',
     identifierRenaming: rawOptions.identifierRenaming ?? true,
+    barcodeRenaming: rawOptions.barcodeRenaming,
     stringEncryption: rawOptions.stringEncryption ?? true,
     constantPooling: rawOptions.constantPooling ?? true,
     controlFlowFlattening: rawOptions.controlFlowFlattening ?? false,
     opaquePredicates: rawOptions.opaquePredicates ?? false,
     removeCommentsAndWhitespace: rawOptions.removeCommentsAndWhitespace ?? true,
     antiTamperPrelude: rawOptions.antiTamperPrelude ?? false,
+    antiHookTraps: rawOptions.antiHookTraps,
+    globalAccessObfuscation: rawOptions.globalAccessObfuscation,
+    memberAccessObfuscation: rawOptions.memberAccessObfuscation,
     deterministic: rawOptions.deterministic ?? false,
+    seed: rawOptions.seed,
     enableSourceRecovery: rawOptions.enableSourceRecovery ?? true,
     projectName: rawOptions.projectName || 'RobloxScript.luau'
   };
@@ -494,9 +499,9 @@ app.get('/api/jobs/:id/download', requireAuth, (req: AuthenticatedRequest, res: 
 
 // --- SOURCE RECOVERY VAULT ROUTES ---
 
-// List user's vault records (metadata only, no plaintext decrypted)
-app.get('/api/vault', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-  const records = db.getUserVaultRecords(req.user!.userId);
+// List user's vault records (metadata only, no plaintext decrypted - Admin only)
+app.get('/api/vault', requireRole(['admin', 'superadmin']), (req: AuthenticatedRequest, res: Response) => {
+  const records = req.user!.role === 'superadmin' ? db.getAllVaultRecords() : db.getUserVaultRecords(req.user!.userId);
   // Don't send encrypted hex payload in list view to save bandwidth
   const safeList = records.map(r => ({
     id: r.id,
@@ -509,8 +514,8 @@ app.get('/api/vault', requireAuth, (req: AuthenticatedRequest, res: Response) =>
   res.json(safeList);
 });
 
-// Recover/decrypt original source code
-app.post('/api/vault/:id/recover', requireAuth, (req: AuthenticatedRequest, res: Response) => {
+// Recover/decrypt original source code (Admin only)
+app.post('/api/vault/:id/recover', requireRole(['admin', 'superadmin']), (req: AuthenticatedRequest, res: Response) => {
   const record = db.getVaultRecordById(req.params.id);
   const ip = getClientIp(req);
 
@@ -519,7 +524,7 @@ app.post('/api/vault/:id/recover', requireAuth, (req: AuthenticatedRequest, res:
     return;
   }
 
-  // Strict ownership check
+  // Strict ownership/admin check
   const isOwner = record.userId === req.user!.userId;
   const isAdmin = req.user!.role === 'admin' || req.user!.role === 'superadmin';
 
@@ -568,6 +573,126 @@ app.post('/api/vault/:id/recover', requireAuth, (req: AuthenticatedRequest, res:
     });
     res.status(500).json({ error: 'Recovery failed: Cryptographic integrity check failed' });
   }
+});
+
+// Direct Deobfuscation from Pasted Obfuscated Code (Admin Tool)
+app.post('/api/admin/deobfuscate-direct', requireRole(['admin', 'superadmin']), (req: AuthenticatedRequest, res: Response) => {
+  const { obfuscatedCode } = req.body;
+  const ip = getClientIp(req);
+
+  if (!obfuscatedCode || typeof obfuscatedCode !== 'string' || obfuscatedCode.trim().length === 0) {
+    res.status(400).json({ error: 'Please paste obfuscated code string to deobfuscate' });
+    return;
+  }
+
+  // 1. Check for embedded AEGIS_VAULT_TAG or _vtag
+  const tagMatch = obfuscatedCode.match(/(?:AEGIS_VAULT_TAG:|_vtag\s*=\s*")([a-f0-9]+)\.([a-f0-9]+)\.([a-f0-9]+)/i);
+  if (tagMatch) {
+    try {
+      const [, encHex, ivHex, tagHex] = tagMatch;
+      const decryptedSource = decryptSource(encHex, ivHex, tagHex);
+
+      logAuditEvent({
+        userId: req.user!.userId,
+        username: req.user!.username,
+        ipAddress: ip,
+        action: 'direct_deobfuscation_success',
+        category: 'vault',
+        status: 'success',
+        details: `Direct deobfuscation executed successfully from embedded AES-256-GCM vault tag (${Buffer.byteLength(decryptedSource, 'utf8')} bytes)`,
+      });
+
+      res.json({
+        success: true,
+        sourceCode: decryptedSource,
+        method: 'embedded_vault_tag',
+        message: 'Source code successfully decrypted and recovered from embedded AES-256-GCM vault tag.',
+      });
+      return;
+    } catch (err: any) {
+      logAuditEvent({
+        userId: req.user!.userId,
+        username: req.user!.username,
+        ipAddress: ip,
+        action: 'direct_deobfuscation_tampered',
+        category: 'vault',
+        status: 'failure',
+        details: `Vault tag decryption failed: ${err.message}`,
+      });
+      res.status(400).json({ error: 'Decryption failed: Embedded Vault Tag was corrupted or tampered' });
+      return;
+    }
+  }
+
+  // 2. Check for database match if tag not found or stripped (Zero-beacon database matching)
+  const jobs = db.getAllJobs();
+  const trimmedInput = obfuscatedCode.trim();
+  for (const j of jobs) {
+    if (j.obfuscatedCode && (j.obfuscatedCode.trim() === trimmedInput || trimmedInput.includes(j.obfuscatedCode.trim()) || j.obfuscatedCode.trim().includes(trimmedInput))) {
+      const userVaults = db.getUserVaultRecords(j.userId);
+      const matchVault = userVaults.find(v => v.projectName === j.projectName) || userVaults[0];
+      if (matchVault) {
+        try {
+          const plain = decryptSource(matchVault.encryptedSource, matchVault.iv, matchVault.authTag);
+          logAuditEvent({
+            userId: req.user!.userId,
+            username: req.user!.username,
+            ipAddress: ip,
+            action: 'direct_deobfuscation_job_match',
+            category: 'vault',
+            status: 'success',
+            details: `Direct deobfuscation matched job ${j.id} (${j.projectName}) via database hash`,
+          });
+
+          res.json({
+            success: true,
+            sourceCode: plain,
+            method: 'database_match',
+            projectName: j.projectName,
+            owner: j.username,
+            message: `Source code recovered from database vault record (${j.projectName}).`,
+          });
+          return;
+        } catch {
+          // continue
+        }
+      }
+    }
+  }
+
+  const records = db.getAllVaultRecords();
+  for (const r of records) {
+    if (obfuscatedCode.includes(r.id) || (r.projectName && obfuscatedCode.includes(r.projectName))) {
+      try {
+        const plain = decryptSource(r.encryptedSource, r.iv, r.authTag);
+        logAuditEvent({
+          userId: req.user!.userId,
+          username: req.user!.username,
+          ipAddress: ip,
+          action: 'direct_deobfuscation_db_match',
+          category: 'vault',
+          status: 'success',
+          details: `Direct deobfuscation matched vault record ${r.id} (${r.projectName})`,
+        });
+
+        res.json({
+          success: true,
+          sourceCode: plain,
+          method: 'database_match',
+          projectName: r.projectName,
+          owner: r.username,
+          message: `Source code recovered from database vault record (${r.projectName}).`,
+        });
+        return;
+      } catch {
+        continue;
+      }
+    }
+  }
+
+  res.status(404).json({
+    error: 'No embedded Aegis Vault Tag or matching record found in the provided code. Make sure the code was obfuscated with "Enable Source Recovery Vault" enabled.',
+  });
 });
 
 // Delete recovery record permanently

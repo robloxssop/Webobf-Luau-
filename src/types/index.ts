@@ -25,6 +25,7 @@ export interface ObfuscationOptions {
   antiTamperPrelude: boolean;
   antiHookTraps?: boolean;
   globalAccessObfuscation?: boolean;
+  memberAccessObfuscation?: boolean;
   deterministic: boolean;
   seed?: number;
   enableSourceRecovery: boolean;

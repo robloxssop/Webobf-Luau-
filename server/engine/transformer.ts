@@ -175,6 +175,109 @@ function unescapeLuaString(rawContent: string): string {
 }
 
 /**
+ * Virtualizes table key assignments ({ key = val }) and dot member expressions (obj.prop)
+ * into index expressions with strings ({ ["key"] = val }, obj["prop"])
+ * so that all identifiers and field names are absorbed into the centralized constant pool.
+ */
+function virtualizeTableKeysAndMembers(source: string): string {
+  try {
+    const ast = luaparse.parse(source, { ranges: true, luaVersion: '5.1' });
+    const replacements: { start: number; end: number; replacement: string }[] = [];
+
+    function walk(node: any) {
+      if (!node || typeof node !== 'object') return;
+
+      if (node.type === 'TableKeyString' && node.key && node.key.name) {
+        replacements.push({
+          start: node.key.range[0],
+          end: node.key.range[1],
+          replacement: `["${node.key.name}"]`
+        });
+      } else if (node.type === 'MemberExpression' && node.indexer === '.' && node.identifier && node.identifier.name) {
+        replacements.push({
+          start: node.base.range[1],
+          end: node.identifier.range[1],
+          replacement: `["${node.identifier.name}"]`
+        });
+      } else if (node.type === 'FunctionDeclaration' && node.identifier && node.identifier.type === 'MemberExpression') {
+        const mem = node.identifier;
+        if (mem.identifier && mem.identifier.name && mem.base && mem.base.range) {
+          const openParenIdx = source.indexOf('(', mem.identifier.range[1]);
+          if (openParenIdx !== -1) {
+            if (mem.indexer === ':') {
+              const hasParams = node.parameters && node.parameters.length > 0;
+              const selfParam = hasParams ? 'self, ' : 'self';
+              replacements.push({
+                start: node.range[0],
+                end: openParenIdx + 1,
+                replacement: `${source.slice(mem.base.range[0], mem.base.range[1])}["${mem.identifier.name}"] = function(${selfParam}`
+              });
+            } else if (mem.indexer === '.') {
+              replacements.push({
+                start: node.range[0],
+                end: openParenIdx + 1,
+                replacement: `${source.slice(mem.base.range[0], mem.base.range[1])}["${mem.identifier.name}"] = function(`
+              });
+            }
+          }
+        }
+      } else if (node.type === 'CallExpression' && node.base && node.base.type === 'MemberExpression' && node.base.indexer === ':') {
+        const mem = node.base;
+        if (mem.base && mem.base.type === 'Identifier' && mem.identifier && mem.identifier.name && mem.base.name !== 'game' && mem.base.name !== 'workspace') {
+          const objName = mem.base.name;
+          const methodName = mem.identifier.name;
+          const openParenIdx = source.indexOf('(', mem.identifier.range[1]);
+          if (openParenIdx !== -1) {
+            const hasArgs = node.arguments && node.arguments.length > 0;
+            replacements.push({
+              start: mem.base.range[0],
+              end: openParenIdx + 1,
+              replacement: `${objName}["${methodName}"](${objName}${hasArgs ? ', ' : ''}`
+            });
+          }
+        }
+      }
+
+      for (const k of Object.keys(node)) {
+        if (k !== 'range' && k !== 'loc') {
+          const child = node[k];
+          if (Array.isArray(child)) child.forEach(walk);
+          else if (child && typeof child === 'object') walk(child);
+        }
+      }
+    }
+
+    walk(ast);
+    replacements.sort((a, b) => b.start - a.start);
+
+    let result = source;
+    for (const r of replacements) {
+      result = result.slice(0, r.start) + r.replacement + result.slice(r.end);
+    }
+    return result;
+  } catch {
+    return source;
+  }
+}
+
+function splitStringIntoFragments(str: string, minLen = 2, maxLen = 4): string[] {
+  if (str.length <= maxLen) return [str];
+  const fragments: string[] = [];
+  let pos = 0;
+  while (pos < str.length) {
+    const rem = str.length - pos;
+    if (rem <= maxLen) {
+      fragments.push(str.slice(pos));
+      break;
+    }
+    const len = Math.floor(Math.random() * (maxLen - minLen + 1)) + minLen;
+    fragments.push(str.slice(pos, pos + len));
+    pos += len;
+  }
+  return fragments;
+}
+
+/**
  * Obfuscates Roblox Lua / Luau code with verified AST transformation and runtime compatibility.
  */
 export function obfuscateLua(
@@ -193,15 +296,16 @@ export function obfuscateLua(
     mode: rawOptions?.mode || 'direct_luau',
     stringEncoding: rawOptions?.stringEncoding || 'byte_array',
     identifierRenaming: isLuraphPreset ? true : (rawOptions?.identifierRenaming ?? true),
-    barcodeRenaming: isLuraphPreset ? true : (rawOptions?.barcodeRenaming ?? false),
+    barcodeRenaming: isLuraphPreset ? true : (rawOptions?.barcodeRenaming ?? (rawOptions?.preset === 'maximum')),
     stringEncryption: isLuraphPreset ? true : (rawOptions?.stringEncryption ?? true),
     constantPooling: isLuraphPreset ? true : (rawOptions?.constantPooling ?? true),
-    controlFlowFlattening: isLuraphPreset ? (rawOptions?.controlFlowFlattening ?? true) : (rawOptions?.controlFlowFlattening ?? false),
-    opaquePredicates: isLuraphPreset ? true : (rawOptions?.opaquePredicates ?? false),
+    controlFlowFlattening: isLuraphPreset ? (rawOptions?.controlFlowFlattening ?? true) : (rawOptions?.preset === 'maximum' ? (rawOptions?.controlFlowFlattening ?? true) : (rawOptions?.controlFlowFlattening ?? false)),
+    opaquePredicates: isLuraphPreset ? true : (rawOptions?.opaquePredicates ?? (rawOptions?.preset !== 'basic')),
     removeCommentsAndWhitespace: rawOptions?.removeCommentsAndWhitespace ?? true,
-    antiTamperPrelude: isLuraphPreset ? true : (rawOptions?.antiTamperPrelude ?? false),
+    antiTamperPrelude: isLuraphPreset ? true : (rawOptions?.antiTamperPrelude ?? (rawOptions?.preset === 'maximum')),
     antiHookTraps: isLuraphPreset ? true : (rawOptions?.antiHookTraps ?? false),
-    globalAccessObfuscation: isLuraphPreset ? true : (rawOptions?.globalAccessObfuscation ?? false),
+    globalAccessObfuscation: isLuraphPreset ? true : (rawOptions?.globalAccessObfuscation ?? (rawOptions?.preset === 'maximum')),
+    memberAccessObfuscation: isLuraphPreset ? true : (rawOptions?.memberAccessObfuscation ?? (rawOptions?.preset === 'maximum')),
     deterministic: rawOptions?.deterministic ?? false,
     enableSourceRecovery: rawOptions?.enableSourceRecovery ?? false,
     projectName: rawOptions?.projectName || 'RobloxScript.luau'
@@ -245,16 +349,30 @@ export function obfuscateLua(
   // Sanitize Luau-specific syntax (compound operators like +=, type annotations) for universal execution
   let processedCode = sanitizeLuauSyntax(sourceCode).sanitized;
 
+  // Apply Member & Table Key Virtualization
+  if (options.memberAccessObfuscation) {
+    processedCode = virtualizeTableKeysAndMembers(processedCode);
+  }
+
+  let activeAst = analysis.ast;
+  if (options.memberAccessObfuscation) {
+    try {
+      activeAst = luaparse.parse(processedCode, { ranges: true, luaVersion: '5.1' });
+    } catch {
+      activeAst = analysis.ast;
+    }
+  }
+
   // --- PHASE 3: IDENTIFIER ANALYSIS ---
-  const localIdentifiers = collectIdentifiersToRename(analysis.ast);
+  const localIdentifiers = collectIdentifiersToRename(activeAst);
   const identifierMap = new Map<string, string>();
 
   let index = 1;
   for (const name of localIdentifiers) {
     if (!identifierMap.has(name)) {
-      const mangled = (options.barcodeRenaming || isLuraphPreset)
+      const mangled = (options.barcodeRenaming || isLuraphPreset || options.preset === 'maximum')
         ? generateBarcodeIdentifier(index, options.seed || prng.nextInt(100, 99999))
-        : `_0x${prng.nextHex(4)}_${index.toString(16)}`;
+        : `_Il_0x${prng.nextHex(3)}_${index.toString(16)}`;
       identifierMap.set(name, mangled);
       index++;
     }
@@ -269,13 +387,15 @@ export function obfuscateLua(
   const VIRTUALIZED_GLOBALS = [
     'game', 'workspace', 'task', 'script', 'math', 'string', 'table',
     'pairs', 'ipairs', 'Vector3', 'CFrame', 'Instance', 'Color3', 'Enum',
-    'tonumber', 'tostring', 'print', 'warn', 'pcall', 'tick'
+    'tonumber', 'tostring', 'print', 'warn', 'pcall', 'tick', 'type',
+    'unpack', 'select', 'setmetatable', 'getmetatable', 'rawget', 'rawset'
   ];
 
   // --- PHASE 4: ENCODING & CONSTANT PROTECTION ---
   const encodedPlaceholderMap = new Map<string, string>();
   let placeholderCounter = 0;
   let activeConstantPool: ConstantPoolResult | null = null;
+  let activeGAccessorName = '_g_' + Math.random().toString(36).substring(2, 6);
   const virtualizedGlobalsUsed: string[] = [];
 
   const useConstantPool = options.constantPooling && mode !== 'luau_vm';
@@ -285,19 +405,34 @@ export function obfuscateLua(
       const stringLiteralRegex = /("([^"\\]*(\\.[^"\\]*)*)"|'([^'\\]*(\\.[^'\\]*)*)')/g;
 
       if (useConstantPool) {
-        // Collect all strings from source code
+        const randTag = Math.random().toString(36).substring(2, 6);
+        const kAccessorName = '_k_' + randTag;
+        const gAccessorName = activeGAccessorName;
+
         const extractedStrings: string[] = [];
+        const stringToFragmentsMap = new Map<string, string[]>();
+
         let match: RegExpExecArray | null;
         while ((match = stringLiteralRegex.exec(processedCode)) !== null) {
           const rawContent = match[0].slice(1, -1);
           if (rawContent.length > 0) {
-            extractedStrings.push(unescapeLuaString(rawContent));
+            const unescaped = unescapeLuaString(rawContent);
+            if (!stringToFragmentsMap.has(unescaped)) {
+              // Fragment splitting for string encryption (Item 4)
+              const fragments = (isLuraphPreset || options.preset === 'maximum' || options.preset === 'advanced')
+                ? splitStringIntoFragments(unescaped, 2, 4)
+                : [unescaped];
+              stringToFragmentsMap.set(unescaped, fragments);
+              for (const frag of fragments) {
+                extractedStrings.push(frag);
+              }
+            }
           }
         }
 
         // Collect virtualized globals if globalAccessObfuscation is enabled
         if (options.globalAccessObfuscation) {
-          const protectedProps = collectTableAndMemberProperties(analysis.ast);
+          const protectedProps = collectTableAndMemberProperties(activeAst);
           for (const g of VIRTUALIZED_GLOBALS) {
             if (!localIdentifiers.has(g) && !protectedProps.has(g)) {
               const gRegex = new RegExp(`(?<![.:"'\\w])${g}\\b`);
@@ -312,33 +447,40 @@ export function obfuscateLua(
         activeConstantPool = createEncryptedConstantPool(extractedStrings, {
           seed: options.seed || prng.nextInt(100, 99999),
           xorKey: prng.nextInt(0x15, 0xeb),
-          accessorName: '_0x_K',
+          accessorName: kAccessorName,
           addDecoys: true,
         });
 
-        // Replace strings with placeholders mapped to _0x_K(id)
+        // Replace strings with concatenated fragment accessors (Item 4 & Bug 8 Fix)
         processedCode = processedCode.replace(stringLiteralRegex, (m) => {
           const rawContent = m.slice(1, -1);
           if (rawContent.length === 0) return m;
           const unescaped = unescapeLuaString(rawContent);
-          const id = activeConstantPool!.idMap.get(unescaped);
-          if (id !== undefined) {
-            const placeholder = `__AEGIS_STR_${placeholderCounter++}__`;
-            encodedPlaceholderMap.set(placeholder, `${activeConstantPool!.accessorName}(0x${id.toString(16)})`);
+          const fragments = stringToFragmentsMap.get(unescaped) || [unescaped];
+          const codeParts: string[] = [];
+          for (const frag of fragments) {
+            const id = activeConstantPool!.idMap.get(frag);
+            if (id !== undefined) {
+              codeParts.push(`${activeConstantPool!.accessorName}(0x${id.toString(16)})`);
+            }
+          }
+          if (codeParts.length > 0) {
+            const placeholder = `__STR_FRAG_${placeholderCounter++}__`;
+            encodedPlaceholderMap.set(placeholder, codeParts.join(' .. '));
             return placeholder;
           }
           return m;
         });
 
-        // Replace virtualized globals with placeholders mapped to _0x_G(id)
+        // Replace virtualized globals with placeholders mapped to gAccessorName(id)
         if (options.globalAccessObfuscation && virtualizedGlobalsUsed.length > 0) {
           for (const g of virtualizedGlobalsUsed) {
             const id = activeConstantPool.idMap.get(g);
             if (id !== undefined) {
               const gRegex = new RegExp(`(?<![.:"'\\w])${g}\\b`, 'g');
-              const placeholder = `__AEGIS_GLOB_${placeholderCounter++}__`;
+              const placeholder = `__GLOB_FRAG_${placeholderCounter++}__`;
               processedCode = processedCode.replace(gRegex, placeholder);
-              encodedPlaceholderMap.set(placeholder, `_0x_G(0x${id.toString(16)})`);
+              encodedPlaceholderMap.set(placeholder, `${gAccessorName}(0x${id.toString(16)})`);
             }
           }
         }
@@ -405,15 +547,15 @@ export function obfuscateLua(
   // --- PHASE 5: TRANSFORMATION (BOOLEANS, NUMBERS, RENAMING) ---
   try {
     if (isLuraphPreset || options.preset !== 'basic' || options.opaquePredicates) {
-      // Transform booleans: true => (not not (0xbeef ~= 0xdead)), false => (not (0xbeef ~= 0xdead))
-      processedCode = processedCode.replace(/\btrue\b/g, '(not not (0xbeef ~= 0xdead))');
-      processedCode = processedCode.replace(/\bfalse\b/g, '(not (0xbeef ~= 0xdead))');
+      // Dynamic runtime-environment boolean transformation (immune to constant folding)
+      processedCode = processedCode.replace(/\btrue\b/g, '((type(pcall) == "function") and (#type("a") == 6))');
+      processedCode = processedCode.replace(/\bfalse\b/g, '((type(pcall) ~= "function") or (#type("a") ~= 6))');
 
       // Safe integer arithmetic transformation using Luraph number encoder
       processedCode = processedCode.replace(/(?<![\w.])\b([0-9][0-9]?)\b(?![\w.])/g, (match, numStr) => {
         const num = parseInt(numStr, 10);
         if (num >= 0 && num <= 50) {
-          return isLuraphPreset ? encodeNumberLuraph(num) : `(${num + 7}-7)`;
+          return (isLuraphPreset || options.preset === 'maximum') ? encodeNumberLuraph(num) : `(${num + 7}-7)`;
         }
         return match;
       });
@@ -499,7 +641,7 @@ export function obfuscateLua(
   }
 
   // --- PHASE 6: DECODING RUNTIME PRELUDE & EXECUTION WRAPPER ---
-  const preludeLines: string[] = [
+  const preludeLines: string[] = options.removeCommentsAndWhitespace ? [] : [
     `-- Protected by AegisLua Code Protection System [Profile: ${options.profile} | Preset: ${options.preset} | Mode: ${mode}]`,
   ];
 
@@ -508,7 +650,7 @@ export function obfuscateLua(
   } else if (applyAntiTamper) {
     preludeLines.push(
       `local _ENV_CHECK = (type(pcall) == "function" and type(table) == "table" and type(string) == "table")`,
-      `if not _ENV_CHECK then error("Environment integrity violation", 2) end`
+      `if not _ENV_CHECK then error("", 0) end`
     );
   }
 
@@ -517,7 +659,7 @@ export function obfuscateLua(
     if (activeConstantPool) {
       preludeLines.push(activeConstantPool.prelude);
       if (options.globalAccessObfuscation && virtualizedGlobalsUsed.length > 0) {
-        preludeLines.push(getGlobalRegistryVirtualizer(activeConstantPool.accessorName).prelude);
+        preludeLines.push(getGlobalRegistryVirtualizer(activeConstantPool.accessorName, activeGAccessorName).prelude);
       }
     } else if (applyStringEnc && encodedPlaceholderMap.size > 0) {
       if (stringEncoding === 'base64_xor') {
@@ -571,10 +713,13 @@ export function obfuscateLua(
     const dynamicWrapper = getDynamicCompilationRuntimeWrapper(encodedPayload.codeSnippet);
     finalOutput = preludeLines.join('\n') + '\n\n' + dynamicWrapper;
   } else {
-    // Direct Luau mode (Default, Requirement 4 & 6)
-    // Runs directly on Roblox Studio Client and Server without loadstring!
     finalOutput = preludeLines.join('\n') + '\n\n' + processedCode.trim();
   }
+
+  // Unconditionally strip all comment lines and fingerprints (Item 1 & 2)
+  finalOutput = finalOutput.replace(/--\[\[[\s\S]*?\]\]/g, '');
+  finalOutput = finalOutput.replace(/--[^\n\r]*/g, '');
+  finalOutput = finalOutput.replace(/\n\s*\n+/g, '\n').trim();
 
   // --- PHASE 7: POST-TRANSFORMATION AST VALIDATION (Requirement 1 & 3) ---
   let astValid = false;

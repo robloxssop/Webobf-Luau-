@@ -1,10 +1,3 @@
-/**
- * Pure-Luau Bytecode Compiler and Virtual Machine Generator
- * Translates Lua/Luau AST statements into an encrypted bytecode representation
- * with randomized opcodes, position-dependent instruction stream cipher,
- * and a self-contained runtime interpreter executing 100% natively in Roblox Studio.
- */
-
 import * as luaparse from 'luaparse';
 
 export interface VMCompilationResult {
@@ -15,6 +8,16 @@ export interface VMCompilationResult {
   error?: string;
 }
 
+/**
+ * Compiles Lua 5.1 / Luau source code into a Luraph-style Custom Bytecode VM.
+ *
+ * Pipeline Architecture:
+ * 1. AST Parsing -> Custom Bytecode instructions & encrypted constant table.
+ * 2. Randomized per-build opcode mapping.
+ * 3. Serialization + RC4-like cipher + 32-bit LCG keystream -> Encrypted BZ String payload.
+ * 4. Loader generator featuring F-table handler dispatchers (F[127], F[32], F[62]), gZ string decryptor,
+ *    and zero-loadstring execution compatible with Roblox Studio & external executors.
+ */
 export function compileToLuauVM(
   sourceCode: string,
   options: {
@@ -22,7 +25,7 @@ export function compileToLuauVM(
     antiTamper?: boolean;
   } = {}
 ): VMCompilationResult {
-  const seed = (options.seed ?? Math.floor(Math.random() * 0xffff)) & 0xff;
+  const seed = (options.seed ?? Math.floor(Math.random() * 0xffffffff)) >>> 0;
 
   let ast: any;
   try {
@@ -43,31 +46,41 @@ export function compileToLuauVM(
     };
   }
 
-  // Opcode Mapping (Randomized per build)
   const baseOpcodes = [
-    'OP_LOADK',      // 1: Load constant into register
-    'OP_GETGLOBAL',  // 2: Load global variable into register
-    'OP_SETGLOBAL',  // 3: Set global variable from register
-    'OP_MOVE',       // 4: Move register to register
-    'OP_CALL',       // 5: Call function in register with args
-    'OP_BINOP',      // 6: Binary operation
-    'OP_NEWTABLE',   // 7: Create table
-    'OP_SETTABLE',   // 8: Table assignment
-    'OP_GETTABLE',   // 9: Table index
-    'OP_JMP',        // 10: Jump
-    'OP_JMPIF',      // 11: Conditional jump
-    'OP_RETURN',     // 12: Return
+    'OP_LOADK',
+    'OP_GETGLOBAL',
+    'OP_SETGLOBAL',
+    'OP_MOVE',
+    'OP_CALL',
+    'OP_BINOP',
+    'OP_NEWTABLE',
+    'OP_SETTABLE',
+    'OP_GETTABLE',
+    'OP_JMP',
+    'OP_JMPIF',
+    'OP_RETURN',
+    'OP_FORPREP',
+    'OP_FORLOOP',
   ];
 
-  // Random permutation of opcode IDs
+  // 1. Per-build randomized opcode mapping
   const opMap = new Map<string, number>();
   const shuffledOps = [...baseOpcodes];
+  let prngState = seed ^ 0xa5a5a5a5;
+  const lcgNext = () => {
+    prngState = (Math.imul(1103515245, prngState) + 12345) >>> 0;
+    return prngState;
+  };
+
   for (let i = shuffledOps.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
+    const j = lcgNext() % (i + 1);
     [shuffledOps[i], shuffledOps[j]] = [shuffledOps[j], shuffledOps[i]];
   }
+
+  // Assign distinct opcode numbers (e.g. 10..23)
+  const opcodeBase = (lcgNext() % 50) + 10;
   shuffledOps.forEach((opName, idx) => {
-    opMap.set(opName, idx + 1);
+    opMap.set(opName, opcodeBase + idx);
   });
 
   const constants: any[] = [];
@@ -78,7 +91,7 @@ export function compileToLuauVM(
     if (constMap.has(key)) {
       return constMap.get(key)!;
     }
-    const idx = constants.length + 1; // 1-indexed in Lua
+    const idx = constants.length + 1;
     constants.push(val);
     constMap.set(key, idx);
     return idx;
@@ -91,7 +104,6 @@ export function compileToLuauVM(
     rawInstructions.push([opCode, a, b, c]);
   }
 
-  // Symbol table mapping local variables to registers
   const localRegs = new Map<string, number>();
   let nextReg = 0;
 
@@ -147,8 +159,29 @@ export function compileToLuauVM(
       const idxReg = allocReg();
       compileExpression(node.index, idxReg);
       emit('OP_GETTABLE', targetReg, baseReg, idxReg);
+    } else if (node.type === 'TableConstructorExpression') {
+      emit('OP_NEWTABLE', targetReg, 0, 0);
+      let fieldIdx = 1;
+      for (const field of node.fields) {
+        if (field.type === 'TableValue') {
+          const valReg = allocReg();
+          compileExpression(field.value, valReg);
+          const kIdx = addConstant(fieldIdx++);
+          emit('OP_SETTABLE', targetReg, kIdx, valReg);
+        } else if (field.type === 'TableKeyString') {
+          const valReg = allocReg();
+          compileExpression(field.value, valReg);
+          const kIdx = addConstant(field.key.name);
+          emit('OP_SETTABLE', targetReg, kIdx, valReg);
+        } else if (field.type === 'TableKey') {
+          const keyReg = allocReg();
+          compileExpression(field.key, keyReg);
+          const valReg = allocReg();
+          compileExpression(field.value, valReg);
+          emit('OP_SETTABLE', targetReg, keyReg, valReg);
+        }
+      }
     } else {
-      // Fallback: load nil
       const kIdx = addConstant(null);
       emit('OP_LOADK', targetReg, kIdx, 0);
     }
@@ -166,7 +199,6 @@ export function compileToLuauVM(
       argRegs.push(aReg);
     }
 
-    // Move arguments into consecutive registers starting at fnReg + 1
     for (let i = 0; i < argCount; i++) {
       emit('OP_MOVE', fnReg + 1 + i, argRegs[i], 0);
     }
@@ -203,6 +235,17 @@ export function compileToLuauVM(
             const kIdx = addConstant(v.name);
             emit('OP_SETGLOBAL', valReg, kIdx, 0);
           }
+        } else if (v.type === 'MemberExpression') {
+          const baseReg = allocReg();
+          compileExpression(v.base, baseReg);
+          const kIdx = addConstant(v.identifier.name);
+          emit('OP_SETTABLE', baseReg, kIdx, valReg);
+        } else if (v.type === 'IndexExpression') {
+          const baseReg = allocReg();
+          compileExpression(v.base, baseReg);
+          const keyReg = allocReg();
+          compileExpression(v.index, keyReg);
+          emit('OP_SETTABLE', baseReg, keyReg, valReg);
         }
       }
     } else if (stmt.type === 'ReturnStatement') {
@@ -213,6 +256,54 @@ export function compileToLuauVM(
       } else {
         emit('OP_RETURN', 0, 0, 0);
       }
+    } else if (stmt.type === 'ForNumericStatement') {
+      const varName = stmt.variable.name;
+      const varReg = allocReg();
+      localRegs.set(varName, varReg);
+
+      compileExpression(stmt.start, varReg);
+      const limitReg = allocReg();
+      compileExpression(stmt.end, limitReg);
+      const stepReg = allocReg();
+      if (stmt.step) {
+        compileExpression(stmt.step, stepReg);
+      } else {
+        emit('OP_LOADK', stepReg, addConstant(1), 0);
+      }
+
+      const prepPcIndex = rawInstructions.length;
+      emit('OP_FORPREP', varReg, 0, 0);
+
+      const bodyStartPc = rawInstructions.length;
+      if (Array.isArray(stmt.body)) {
+        for (const s of stmt.body) {
+          compileStatement(s);
+        }
+      }
+
+      const loopPcIndex = rawInstructions.length;
+      emit('OP_FORLOOP', varReg, bodyStartPc, 0);
+      const totalLoopSpan = loopPcIndex - prepPcIndex;
+      rawInstructions[prepPcIndex][2] = totalLoopSpan;
+    } else if (stmt.type === 'IfStatement') {
+      for (const clause of stmt.clauses) {
+        const condReg = allocReg();
+        if (clause.condition) {
+          compileExpression(clause.condition, condReg);
+        }
+        const jmpIfIndex = rawInstructions.length;
+        if (clause.condition) {
+          emit('OP_JMPIF', condReg, 0, 0);
+        }
+        if (Array.isArray(clause.body)) {
+          for (const s of clause.body) {
+            compileStatement(s);
+          }
+        }
+        if (clause.condition) {
+          rawInstructions[jmpIfIndex][2] = rawInstructions.length - jmpIfIndex;
+        }
+      }
     }
   }
 
@@ -220,132 +311,275 @@ export function compileToLuauVM(
     compileStatement(stmt);
   }
 
-  // Final return instruction
   emit('OP_RETURN', 0, 0, 0);
 
-  // Position-dependent bytecode encryption
-  const encryptedInstructions: [number, number, number, number][] = [];
-  for (let i = 0; i < rawInstructions.length; i++) {
-    const pc = i + 1; // 1-based PC in Lua
-    const [op, a, b, c] = rawInstructions[i];
-    const encOp = (op ^ ((seed + pc * 47) % 256)) & 0xff;
-    const encA = (a ^ ((seed + pc * 31) % 256)) & 0xff;
-    const encB = (b ^ ((seed + pc * 19) % 256)) & 0xff;
-    const encC = (c ^ ((seed + pc * 13) % 256)) & 0xff;
-    encryptedInstructions.push([encOp, encA, encB, encC]);
+  // 2. Serialize Bytecode + Constants into BZ Payload
+  const serializedBytes: number[] = [];
+
+  // Pack instruction length (2 bytes)
+  const instCount = rawInstructions.length;
+  serializedBytes.push((instCount >> 8) & 0xff, instCount & 0xff);
+
+  // Pack raw instructions [op, a, b, c]
+  for (const [op, a, b, c] of rawInstructions) {
+    serializedBytes.push(op & 0xff, a & 0xff, b & 0xff, c & 0xff);
   }
 
-  // Format constants pool in Lua syntax
-  const constStrs = constants.map((c) => {
-    if (c === null) return 'nil';
-    if (typeof c === 'string') return JSON.stringify(c);
-    if (typeof c === 'number') return c.toString();
-    if (typeof c === 'boolean') return c ? 'true' : 'false';
-    return 'nil';
-  });
+  // Pack constants length (2 bytes)
+  const kCount = constants.length;
+  serializedBytes.push((kCount >> 8) & 0xff, kCount & 0xff);
 
-  const bcLines = encryptedInstructions
-    .map((inst) => `{${inst[0]},${inst[1]},${inst[2]},${inst[3]}}`)
-    .join(',');
+  // Pack serialized constants
+  for (const c of constants) {
+    if (c === null) {
+      serializedBytes.push(0); // type 0 = nil
+    } else if (typeof c === 'boolean') {
+      serializedBytes.push(1, c ? 1 : 0); // type 1 = boolean
+    } else if (typeof c === 'number') {
+      serializedBytes.push(2); // type 2 = number
+      const numStr = c.toString();
+      serializedBytes.push(numStr.length & 0xff);
+      for (let i = 0; i < numStr.length; i++) {
+        serializedBytes.push(numStr.charCodeAt(i) & 0xff);
+      }
+    } else if (typeof c === 'string') {
+      serializedBytes.push(3); // type 3 = string
+      const strBytes = Array.from(Buffer.from(c, 'utf8'));
+      serializedBytes.push((strBytes.length >> 8) & 0xff, strBytes.length & 0xff);
+      for (const b of strBytes) {
+        serializedBytes.push(b & 0xff);
+      }
+    } else {
+      serializedBytes.push(0);
+    }
+  }
 
+  // RC4-like + 16-bit float-safe LCG Keystream Encryption over serialized bytes
+  const rc4S = Array.from({ length: 256 }, (_, i) => i);
+  let j = 0;
+  const keyByte = seed % 256;
+  for (let i = 0; i < 256; i++) {
+    j = (j + rc4S[i] + keyByte + (i * 37)) % 256;
+    [rc4S[i], rc4S[j]] = [rc4S[j], rc4S[i]];
+  }
+
+  const encryptedBZBytes: number[] = [];
+  let rc4I = 0;
+  let rc4J = 0;
+  let lcgKey = seed % 65536;
+
+  for (let pos = 0; pos < serializedBytes.length; pos++) {
+    rc4I = (rc4I + 1) % 256;
+    rc4J = (rc4J + rc4S[rc4I]) % 256;
+    [rc4S[rc4I], rc4S[rc4J]] = [rc4S[rc4J], rc4S[rc4I]];
+    const rc4K = rc4S[(rc4S[rc4I] + rc4S[rc4J]) % 256];
+
+    lcgKey = (lcgKey * 31 + 10139) % 65536;
+    const lcgK = (lcgKey >>> 8) & 0xff;
+
+    const encByte = (serializedBytes[pos] ^ rc4K ^ lcgK ^ ((pos * 13) % 256)) & 0xff;
+    encryptedBZBytes.push(encByte);
+  }
+
+  // Format BZ payload string with strict 3-digit decimal escape padding
+  const bzPayloadStr = encryptedBZBytes.map((b) => `\\${b.toString().padStart(3, '0')}`).join('');
+
+
+  // 3. Build F-Table Loader Wrapper (F[127] for VM dispatcher, F[32]/F[62] for Decoders, gZ for stream reader)
   const opLoadk = opMap.get('OP_LOADK');
   const opGetglobal = opMap.get('OP_GETGLOBAL');
   const opSetglobal = opMap.get('OP_SETGLOBAL');
   const opMove = opMap.get('OP_MOVE');
   const opCall = opMap.get('OP_CALL');
   const opBinop = opMap.get('OP_BINOP');
+  const opNewtable = opMap.get('OP_NEWTABLE');
   const opGettable = opMap.get('OP_GETTABLE');
   const opSettable = opMap.get('OP_SETTABLE');
   const opReturn = opMap.get('OP_RETURN');
+  const opForprep = opMap.get('OP_FORPREP');
+  const opForloop = opMap.get('OP_FORLOOP');
+  const opJmpif = opMap.get('OP_JMPIF');
 
-  const vmScript = `-- [AegisLua Virtual Machine Container]
--- Mode: Luau Virtual Machine | Target: Roblox Studio Client & Server (Zero loadstring)
-local _BC = {${bcLines}}
-local _K = {${constStrs.join(',')}}
-local _SEED = ${seed}
+  const randTag = Math.random().toString(36).substring(2, 6);
+  const bzVar = `_bz_${randTag}`;
+  const fTableVar = `F_${randTag}`;
+  const gzVar = `gZ_${randTag}`;
 
-local function _AEGIS_VM(_bytecode, _constants, _seed)
-    local _stack = {}
-    local _pc = 1
-    local _env = (type(getfenv) == "function" and getfenv()) or _G
-    local _unpack = unpack or table.unpack
-    local _bxor = (type(bit32) == "table" and bit32.bxor) or function(a, b)
-        local res, bit = 0, 1
-        while a > 0 or b > 0 do
-            local ra, rb = a % 2, b % 2
-            if ra ~= rb then res = res + bit end
-            a = math.floor(a / 2)
-            b = math.floor(b / 2)
-            bit = bit * 2
-        end
-        return res
+  const vmLoaderScript = `local ${bzVar} = "${bzPayloadStr}"
+local ${fTableVar} = {}
+
+${fTableVar}[32] = function(b, k)
+    local i, j = 0, 0
+    local s = {}
+    for idx = 0, 255 do s[idx] = idx end
+    local kb = (k % 256)
+    for idx = 0, 255 do
+        j = (j + s[idx] + kb + (idx * 37)) % 256
+        s[idx], s[j] = s[j], s[idx]
     end
+    return s
+end
 
-    while _pc <= #_bytecode do
-        local _i = _bytecode[_pc]
-        local _op = _bxor(_i[1], (_seed + (_pc * 47)) % 256)
-        local _a  = _bxor(_i[2], (_seed + (_pc * 31)) % 256)
-        local _b  = _bxor(_i[3], (_seed + (_pc * 19)) % 256)
-        local _c  = _bxor(_i[4], (_seed + (_pc * 13)) % 256)
+${fTableVar}[62] = function(bz, k, s)
+    local res = {}
+    local len = #bz
+    local i, j = 0, 0
+    local lcg = k % 65536
+    for p = 1, len do
+        i = (i + 1) % 256
+        j = (j + s[i]) % 256
+        s[i], s[j] = s[j], s[i]
+        local k1 = s[(s[i] + s[j]) % 256]
+        lcg = (lcg * 31 + 10139) % 65536
+        local k2 = math.floor(lcg / 256) % 256
+        local b = bz:byte(p)
+        local dec = (type(bit32) == "table" and bit32.bxor(b, k1, k2, (p - 1) * 13 % 256)) or (function()
+            local r, m = 0, 1
+            local x1 = b
+            local x2 = k1
+            local x3 = k2
+            local x4 = ((p - 1) * 13) % 256
+            while x1 > 0 or x2 > 0 or x3 > 0 or x4 > 0 do
+                local b1, b2, b3, b4 = x1 % 2, x2 % 2, x3 % 2, x4 % 2
+                if (b1 + b2 + b3 + b4) % 2 == 1 then r = r + m end
+                x1, x2, x3, x4 = math.floor(x1/2), math.floor(x2/2), math.floor(x3/2), math.floor(x4/2)
+                m = m * 2
+            end
+            return r
+        end)()
+        res[p] = dec
+    end
+    return res
+end
 
-        if _op == ${opLoadk} then
-            _stack[_a] = _constants[_b]
-        elseif _op == ${opGetglobal} then
-            local _gname = _constants[_b]
-            _stack[_a] = _env[_gname]
-        elseif _op == ${opSetglobal} then
-            local _gname = _constants[_b]
-            _env[_gname] = _stack[_a]
-        elseif _op == ${opMove} then
-            _stack[_a] = _stack[_b]
-        elseif _op == ${opCall} then
-            local _fn = _stack[_a]
-            if type(_fn) == "function" then
-                local _args = {}
-                for _idx = 1, _c do
-                    _args[_idx] = _stack[_a + _idx]
-                end
-                local _res = _fn(_unpack(_args, 1, _c))
-                _stack[_b] = _res
+
+${fTableVar}[5] = function(decBytes)
+    local pos = 1
+    local function r8()
+        local b = decBytes[pos]
+        pos = pos + 1
+        return b
+    end
+    local function r16()
+        local h = r8()
+        local l = r8()
+        return h * 256 + l
+    end
+    
+    local numInst = r16()
+    local insts = {}
+    for i = 1, numInst do
+        insts[i] = {r8(), r8(), r8(), r8()}
+    end
+    
+    local numK = r16()
+    local ks = {}
+    for i = 1, numK do
+        local kt = r8()
+        if kt == 0 then
+            ks[i] = nil
+        elseif kt == 1 then
+            ks[i] = (r8() == 1)
+        elseif kt == 2 then
+            local nlen = r8()
+            local ns = ""
+            for p = 1, nlen do ns = ns .. string.char(r8()) end
+            ks[i] = tonumber(ns)
+        elseif kt == 3 then
+            local slen = r16()
+            local ss = {}
+            for p = 1, slen do ss[p] = string.char(r8()) end
+            ks[i] = table.concat(ss)
+        end
+    end
+    return insts, ks
+end
+
+${fTableVar}[127] = function(insts, ks)
+    local stk = {}
+    local pc = 1
+    local env = (type(getfenv) == "function" and getfenv()) or _G
+    local unp = unpack or table.unpack
+    
+    while pc <= #insts do
+        local inst = insts[pc]
+        local op, a, b, c = inst[1], inst[2], inst[3], inst[4]
+        
+        if op == ${opLoadk} then
+            stk[a] = ks[b]
+        elseif op == ${opGetglobal} then
+            stk[a] = env[ks[b]]
+        elseif op == ${opSetglobal} then
+            env[ks[b]] = stk[a]
+        elseif op == ${opMove} then
+            stk[a] = stk[b]
+        elseif op == ${opCall} then
+            local fn = stk[a]
+            if type(fn) == "function" then
+                local args = {}
+                for idx = 1, c do args[idx] = stk[a + idx] end
+                local res = fn(unp(args, 1, c))
+                stk[b] = res
             end
-        elseif _op == ${opBinop} then
-            local _opStr = _constants[_c] or "+"
-            local _v1 = _stack[_a]
-            local _v2 = _stack[_b]
-            if _opStr == "+" then _stack[_a] = _v1 + _v2
-            elseif _opStr == "-" then _stack[_a] = _v1 - _v2
-            elseif _opStr == "*" then _stack[_a] = _v1 * _v2
-            elseif _opStr == "/" then _stack[_a] = _v1 / _v2
-            elseif _opStr == ".." then _stack[_a] = tostring(_v1) .. tostring(_v2)
-            elseif _opStr == "==" then _stack[_a] = (_v1 == _v2)
+        elseif op == ${opBinop} then
+            local opStr = ks[c] or "+"
+            local v1, v2 = stk[a], stk[b]
+            if opStr == "+" then stk[a] = v1 + v2
+            elseif opStr == "-" then stk[a] = v1 - v2
+            elseif opStr == "*" then stk[a] = v1 * v2
+            elseif opStr == "/" then stk[a] = v1 / v2
+            elseif opStr == ".." then stk[a] = tostring(v1) .. tostring(v2)
+            elseif opStr == "==" then stk[a] = (v1 == v2)
             end
-        elseif _op == ${opGettable} then
-            local _tbl = _stack[_b]
-            if type(_tbl) == "table" or type(_tbl) == "userdata" then
-                _stack[_a] = _tbl[_constants[_c]]
+        elseif op == ${opNewtable} then
+            stk[a] = {}
+        elseif op == ${opGettable} then
+            local tbl = stk[b]
+            if type(tbl) == "table" or type(tbl) == "userdata" then
+                stk[a] = tbl[ks[c]]
             end
-        elseif _op == ${opSettable} then
-            local _tbl = _stack[_a]
-            if type(_tbl) == "table" then
-                _tbl[_constants[_b]] = _stack[_c]
+        elseif op == ${opSettable} then
+            local tbl = stk[a]
+            if type(tbl) == "table" then
+                tbl[ks[b]] = stk[c]
             end
-        elseif _op == ${opReturn} then
-            if _b > 0 then
-                return _stack[_a]
+        elseif op == ${opForprep} then
+            stk[a] = stk[a] - stk[a + 2]
+            pc = pc + b
+        elseif op == ${opForloop} then
+            local step = stk[a + 2]
+            local count = stk[a] + step
+            stk[a] = count
+            if (step > 0 and count <= stk[a + 1]) or (step < 0 and count >= stk[a + 1]) then
+                pc = pc - b
             end
+        elseif op == ${opJmpif} then
+            if stk[a] then
+                pc = pc + b
+            end
+        elseif op == ${opReturn} then
+            if b > 0 then return stk[a] end
             return
         end
-        _pc = _pc + 1
+        pc = pc + 1
     end
 end
 
-_AEGIS_VM(_BC, _K, _SEED)
+local function ${gzVar}()
+    local sTable = ${fTableVar}[32](${bzVar}, ${seed})
+    local dec = ${fTableVar}[62](${bzVar}, ${seed}, sTable)
+    local insts, ks = ${fTableVar}[5](dec)
+    return ${fTableVar}[127](insts, ks)
+end
+
+${gzVar}()
 `;
 
   return {
     success: true,
-    code: vmScript.trim(),
-    instructionCount: encryptedInstructions.length,
+    code: vmLoaderScript.trim(),
+    instructionCount: rawInstructions.length,
     constantCount: constants.length,
   };
 }
+
