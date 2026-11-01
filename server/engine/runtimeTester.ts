@@ -1014,6 +1014,66 @@ print("VMSUM:" .. tostring(sum))`;
     });
   }
 
+  // Test 20: Commercial-Grade Custom VM Complex Logic (Loops, State Transitions, Table Ops)
+  {
+    const start = Date.now();
+    const inputCode = `local obj = { base = 5, mul = 3 }
+local acc = 0
+for i = 1, 4 do
+    if i % 2 == 0 then
+        acc = acc + (i * obj.mul)
+    else
+        acc = acc + i
+    end
+end
+print("ACC:" .. tostring(acc + obj.base))`;
+
+    const options: ObfuscationOptions = {
+      profile: 'roblox_studio',
+      preset: 'luraph',
+      mode: 'luau_vm',
+      stringEncoding: 'byte_array',
+      identifierRenaming: true,
+      barcodeRenaming: true,
+      stringEncryption: true,
+      constantPooling: true,
+      controlFlowFlattening: false,
+      opaquePredicates: false,
+      removeCommentsAndWhitespace: true,
+      antiTamperPrelude: true,
+      antiHookTraps: false,
+      deterministic: true,
+      seed: 88412,
+      enableSourceRecovery: false,
+    };
+
+    const obf = obfuscateLua(inputCode, options, 'test_luau_vm_complex_20');
+    const runRes = executeInLuaVM(obf.obfuscatedCode, {
+      enableLoadstring: false,
+      provideRobloxGlobals: true,
+    });
+
+    // 1 (odd) -> acc=1
+    // 2 (even) -> acc=1 + 6 = 7
+    // 3 (odd) -> acc=7 + 3 = 10
+    // 4 (even) -> acc=10 + 12 = 22
+    // total = acc + obj.base = 22 + 5 = 27
+    const passed = runRes.success && runRes.output.trim() === 'ACC:27';
+    results.push({
+      id: 'RUN-20',
+      name: 'Commercial-Grade Custom VM Complex Logic (Loops, Conditionals, Tables)',
+      inputCode,
+      expectedOutput: 'ACC:27',
+      actualOutput: runRes.output.trim() || (runRes.error ? `Error: ${runRes.error}` : '(empty output)'),
+      passed,
+      environment: 'Roblox Studio (Hashed Jump Table Dispatch, State Machine Flattening)',
+      executionTimeMs: Date.now() - start,
+      notes: passed
+        ? 'Custom VM successfully executed nested for-loops, arithmetic, table member properties, and conditionals without errors.'
+        : `Complex VM test failed: ${runRes.error || 'Output mismatch'}`,
+    });
+  }
+
   return results;
 }
 

@@ -118,12 +118,33 @@ export function encodeNumberLuraph(n: number): string {
   }
   if (n === 1) {
     const k = Math.floor(Math.random() * 20) + 5;
-    return `(0x${(k * 2 + 1).toString(16)} - 0x${(k * 2).toString(16)})`;
+    return `((0x${(k * 2 + 1).toString(16)} - 0x${(k * 2).toString(16)}))`;
   }
-  if (n > 1 && n <= 100) {
-    const offset = 0x2b;
-    const total = n + offset;
-    return `(0x${total.toString(16)} - 0x${offset.toString(16)})`;
+  
+  const absN = Math.abs(n);
+  const isNeg = n < 0;
+  const variant = Math.floor(Math.random() * 3);
+  let res = String(absN);
+
+  if (variant === 0) {
+    const offset = 0x3d;
+    const total = absN + offset;
+    res = `(0x${total.toString(16)} - 0x${offset.toString(16)})`;
+  } else if (variant === 1) {
+    const offset1 = 0x17;
+    const offset2 = 0x2b;
+    const total = absN + offset1 + offset2;
+    res = `((0x${total.toString(16)} - 0x${offset1.toString(16)}) - 0x${offset2.toString(16)})`;
+  } else {
+    const mask = 0x7f;
+    const xorVal = Math.floor(absN) ^ mask;
+    if (Number.isInteger(absN) && absN <= 255) {
+      res = `((type(bit32) == "table" and bit32.bxor(0x${xorVal.toString(16)}, 0x${mask.toString(16)})) or (0x${(absN + 15).toString(16)} - 0x0f))`;
+    } else {
+      const offset = 0x1a;
+      res = `((0x${(absN + offset).toString(16)} - 0x${offset.toString(16)}))`;
+    }
   }
-  return String(n);
+
+  return isNeg ? `(-${res})` : res;
 }
