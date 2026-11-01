@@ -962,5 +962,58 @@ print("Z=" .. tostring(z))`;
     });
   }
 
+  // Test 19: Pure Luau Custom VM (Luraph-style Bytecode, Encrypted BZ Payload, F-Table Dispatchers)
+  {
+    const start = Date.now();
+    const inputCode = `local val1 = 12
+local val2 = 33
+local sum = val1 + val2
+print("VMSUM:" .. tostring(sum))`;
+
+    const options: ObfuscationOptions = {
+      profile: 'roblox_studio',
+      preset: 'luraph',
+      mode: 'luau_vm',
+      stringEncoding: 'byte_array',
+      identifierRenaming: true,
+      barcodeRenaming: true,
+      stringEncryption: true,
+      constantPooling: true,
+      controlFlowFlattening: false,
+      opaquePredicates: false,
+      removeCommentsAndWhitespace: true,
+      antiTamperPrelude: true,
+      antiHookTraps: false,
+      deterministic: true,
+      seed: 99123,
+      enableSourceRecovery: false,
+    };
+
+    const obf = obfuscateLua(inputCode, options, 'test_luau_vm_19');
+    const hasFTable = obf.obfuscatedCode.includes('[127] =') || obf.obfuscatedCode.includes('[32] =');
+    const hasBZPayload = obf.obfuscatedCode.includes('_bz_');
+    const noRawLoadstring = !obf.obfuscatedCode.includes('loadstring');
+    const runRes = executeInLuaVM(obf.obfuscatedCode, {
+      enableLoadstring: false, // Roblox Studio default: loadstring is unavailable
+      provideRobloxGlobals: true,
+    });
+
+    const passed = runRes.success && runRes.output.trim() === 'VMSUM:45' && hasFTable && hasBZPayload && noRawLoadstring;
+    results.push({
+      id: 'RUN-19',
+      name: 'Pure Luau Custom VM (Shuffled Bytecode, Encrypted BZ, F-Table Dispatch, Zero Loadstring)',
+      inputCode,
+      expectedOutput: 'VMSUM:45',
+      actualOutput: runRes.output.trim() || (runRes.error ? `Error: ${runRes.error}` : '(empty output)'),
+      passed,
+      environment: 'Roblox Studio (Zero Loadstring, Pure Register-Based Bytecode Interpreter)',
+      executionTimeMs: Date.now() - start,
+      notes: passed
+        ? 'Custom VM successfully executed bytecode from encrypted BZ stream with closed proxy env and randomized opcodes without loadstring.'
+        : `Custom VM test failed: ${runRes.error || 'Output mismatch'}`,
+    });
+  }
+
   return results;
 }
+

@@ -9,14 +9,14 @@ export interface VMCompilationResult {
 }
 
 /**
- * Compiles Lua 5.1 / Luau source code into a Luraph-style Custom Bytecode VM.
+ * Compiles Lua 5.1 / Luau source code into a Luraph-style Custom Bytecode Virtual Machine.
  *
  * Pipeline Architecture:
  * 1. AST Parsing -> Custom Bytecode instructions & encrypted constant table.
  * 2. Randomized per-build opcode mapping.
- * 3. Serialization + RC4-like cipher + 32-bit LCG keystream -> Encrypted BZ String payload.
- * 4. Loader generator featuring F-table handler dispatchers (F[127], F[32], F[62]), gZ string decryptor,
- *    and zero-loadstring execution compatible with Roblox Studio & external executors.
+ * 3. Serialization + RC4-like cipher + 16-bit safe LCG keystream -> Encrypted BZ String payload.
+ * 4. Loader generator featuring F-table handler dispatchers (F[127] VM, F[32] S-box, F[62] Decryptor, F[5] Deserializer),
+ *    gZ entry point, closed proxy environment (zero _G leaks), runtime-derived seed, and zero-loadstring execution.
  */
 export function compileToLuauVM(
   sourceCode: string,
@@ -47,20 +47,42 @@ export function compileToLuauVM(
   }
 
   const baseOpcodes = [
-    'OP_LOADK',
-    'OP_GETGLOBAL',
-    'OP_SETGLOBAL',
-    'OP_MOVE',
-    'OP_CALL',
-    'OP_BINOP',
-    'OP_NEWTABLE',
-    'OP_SETTABLE',
-    'OP_GETTABLE',
-    'OP_JMP',
-    'OP_JMPIF',
-    'OP_RETURN',
-    'OP_FORPREP',
-    'OP_FORLOOP',
+    'LOADK',
+    'LOADNIL',
+    'LOADBOOL',
+    'MOVE',
+    'GETGLOBAL',
+    'SETGLOBAL',
+    'NEWTABLE',
+    'GETTABLE_K',
+    'GETTABLE_R',
+    'SETTABLE_K',
+    'SETTABLE_R',
+    'ADD',
+    'SUB',
+    'MUL',
+    'DIV',
+    'MOD',
+    'POW',
+    'CONCAT',
+    'EQ',
+    'NEQ',
+    'LT',
+    'LE',
+    'GT',
+    'GE',
+    'AND',
+    'OR',
+    'UNM',
+    'NOT',
+    'LEN',
+    'CALL',
+    'RETURN',
+    'JMP',
+    'JMPIF',
+    'JMPIFNOT',
+    'FORPREP',
+    'FORLOOP',
   ];
 
   // 1. Per-build randomized opcode mapping
@@ -77,7 +99,6 @@ export function compileToLuauVM(
     [shuffledOps[i], shuffledOps[j]] = [shuffledOps[j], shuffledOps[i]];
   }
 
-  // Assign distinct opcode numbers (e.g. 10..23)
   const opcodeBase = (lcgNext() % 50) + 10;
   shuffledOps.forEach((opName, idx) => {
     opMap.set(opName, opcodeBase + idx);
@@ -91,7 +112,7 @@ export function compileToLuauVM(
     if (constMap.has(key)) {
       return constMap.get(key)!;
     }
-    const idx = constants.length + 1;
+    const idx = constants.length + 1; // 1-based index in Lua
     constants.push(val);
     constMap.set(key, idx);
     return idx;
@@ -99,9 +120,10 @@ export function compileToLuauVM(
 
   const rawInstructions: [number, number, number, number][] = [];
 
-  function emit(op: string, a = 0, b = 0, c = 0) {
+  function emit(op: string, a = 0, b = 0, c = 0): number {
     const opCode = opMap.get(op) || 0;
     rawInstructions.push([opCode, a, b, c]);
+    return rawInstructions.length - 1;
   }
 
   const localRegs = new Map<string, number>();
@@ -122,94 +144,134 @@ export function compileToLuauVM(
         strVal = node.value ?? '';
       }
       const kIdx = addConstant(strVal);
-      emit('OP_LOADK', targetReg, kIdx, 0);
+      emit('LOADK', targetReg, kIdx, 0);
     } else if (node.type === 'NumericLiteral') {
       const kIdx = addConstant(node.value);
-      emit('OP_LOADK', targetReg, kIdx, 0);
+      emit('LOADK', targetReg, kIdx, 0);
     } else if (node.type === 'BooleanLiteral') {
-      const kIdx = addConstant(node.value);
-      emit('OP_LOADK', targetReg, kIdx, 0);
+      emit('LOADBOOL', targetReg, node.value ? 1 : 0, 0);
     } else if (node.type === 'NilLiteral') {
-      const kIdx = addConstant(null);
-      emit('OP_LOADK', targetReg, kIdx, 0);
+      emit('LOADNIL', targetReg, 0, 0);
     } else if (node.type === 'Identifier') {
       if (localRegs.has(node.name)) {
-        emit('OP_MOVE', targetReg, localRegs.get(node.name)!, 0);
+        emit('MOVE', targetReg, localRegs.get(node.name)!, 0);
       } else {
         const kIdx = addConstant(node.name);
-        emit('OP_GETGLOBAL', targetReg, kIdx, 0);
+        emit('GETGLOBAL', targetReg, kIdx, 0);
       }
-    } else if (node.type === 'CallExpression') {
-      compileCall(node, targetReg);
     } else if (node.type === 'BinaryExpression') {
       const regL = allocReg();
       const regR = allocReg();
       compileExpression(node.left, regL);
       compileExpression(node.right, regR);
-      const opIdx = addConstant(node.operator);
-      emit('OP_BINOP', targetReg, regL, regR);
+
+      const binMap: Record<string, string> = {
+        '+': 'ADD',
+        '-': 'SUB',
+        '*': 'MUL',
+        '/': 'DIV',
+        '%': 'MOD',
+        '^': 'POW',
+        '..': 'CONCAT',
+        '==': 'EQ',
+        '~=': 'NEQ',
+        '<': 'LT',
+        '<=': 'LE',
+        '>': 'GT',
+        '>=': 'GE',
+        'and': 'AND',
+        'or': 'OR',
+      };
+      const opName = binMap[node.operator] || 'ADD';
+      emit(opName, targetReg, regL, regR);
+    } else if (node.type === 'UnaryExpression') {
+      const regA = allocReg();
+      compileExpression(node.argument, regA);
+      if (node.operator === '-') emit('UNM', targetReg, regA, 0);
+      else if (node.operator === 'not') emit('NOT', targetReg, regA, 0);
+      else if (node.operator === '#') emit('LEN', targetReg, regA, 0);
+    } else if (node.type === 'CallExpression') {
+      compileCall(node, targetReg);
     } else if (node.type === 'MemberExpression') {
       const baseReg = allocReg();
       compileExpression(node.base, baseReg);
       const propIdx = addConstant(node.identifier.name);
-      emit('OP_GETTABLE', targetReg, baseReg, propIdx);
+      emit('GETTABLE_K', targetReg, baseReg, propIdx);
     } else if (node.type === 'IndexExpression') {
       const baseReg = allocReg();
       compileExpression(node.base, baseReg);
       const idxReg = allocReg();
       compileExpression(node.index, idxReg);
-      emit('OP_GETTABLE', targetReg, baseReg, idxReg);
+      emit('GETTABLE_R', targetReg, baseReg, idxReg);
     } else if (node.type === 'TableConstructorExpression') {
-      emit('OP_NEWTABLE', targetReg, 0, 0);
-      let fieldIdx = 1;
+      emit('NEWTABLE', targetReg, 0, 0);
+      let arrayIndex = 1;
       for (const field of node.fields) {
         if (field.type === 'TableValue') {
           const valReg = allocReg();
           compileExpression(field.value, valReg);
-          const kIdx = addConstant(fieldIdx++);
-          emit('OP_SETTABLE', targetReg, kIdx, valReg);
+          emit('SETTABLE_K', targetReg, addConstant(arrayIndex++), valReg);
         } else if (field.type === 'TableKeyString') {
           const valReg = allocReg();
           compileExpression(field.value, valReg);
-          const kIdx = addConstant(field.key.name);
-          emit('OP_SETTABLE', targetReg, kIdx, valReg);
+          emit('SETTABLE_K', targetReg, addConstant(field.key.name), valReg);
         } else if (field.type === 'TableKey') {
           const keyReg = allocReg();
           compileExpression(field.key, keyReg);
           const valReg = allocReg();
           compileExpression(field.value, valReg);
-          emit('OP_SETTABLE', targetReg, keyReg, valReg);
+          emit('SETTABLE_R', targetReg, keyReg, valReg);
         }
       }
-    } else {
-      const kIdx = addConstant(null);
-      emit('OP_LOADK', targetReg, kIdx, 0);
     }
   }
 
-  function compileCall(node: any, resultReg: number) {
+  function compileCall(node: any, targetReg: number) {
     const fnReg = allocReg();
-    compileExpression(node.base, fnReg);
 
-    const argCount = node.arguments.length;
+    // Check method call (colon operator e.g. obj:method(...))
+    if (node.base.type === 'MemberExpression' && node.base.indexer === ':') {
+      const objReg = allocReg();
+      compileExpression(node.base.base, objReg);
+      const methodIdx = addConstant(node.base.identifier.name);
+      emit('GETTABLE_K', fnReg, objReg, methodIdx);
+
+      const argRegs: number[] = [objReg];
+      for (const arg of node.arguments) {
+        const aReg = allocReg();
+        compileExpression(arg, aReg);
+        argRegs.push(aReg);
+      }
+
+      for (let i = 0; i < argRegs.length; i++) {
+        emit('MOVE', fnReg + 1 + i, argRegs[i], 0);
+      }
+
+      emit('CALL', fnReg, argRegs.length, targetReg);
+      return;
+    }
+
+    compileExpression(node.base, fnReg);
     const argRegs: number[] = [];
-    for (let i = 0; i < argCount; i++) {
+    for (const arg of node.arguments) {
       const aReg = allocReg();
-      compileExpression(node.arguments[i], aReg);
+      compileExpression(arg, aReg);
       argRegs.push(aReg);
     }
 
-    for (let i = 0; i < argCount; i++) {
-      emit('OP_MOVE', fnReg + 1 + i, argRegs[i], 0);
+    for (let i = 0; i < argRegs.length; i++) {
+      emit('MOVE', fnReg + 1 + i, argRegs[i], 0);
     }
 
-    emit('OP_CALL', fnReg, resultReg, argCount);
+    emit('CALL', fnReg, argRegs.length, targetReg);
   }
 
   function compileStatement(stmt: any) {
+    if (!stmt) return;
+
     if (stmt.type === 'CallStatement') {
-      const dummyReg = allocReg();
-      compileCall(stmt.expression, dummyReg);
+      const dummy = allocReg();
+      compileCall(stmt.expression, dummy);
     } else if (stmt.type === 'LocalStatement') {
       for (let i = 0; i < stmt.variables.length; i++) {
         const v = stmt.variables[i];
@@ -218,7 +280,7 @@ export function compileToLuauVM(
         if (stmt.init && stmt.init[i]) {
           compileExpression(stmt.init[i], r);
         } else {
-          emit('OP_LOADK', r, addConstant(null), 0);
+          emit('LOADNIL', r, 0, 0);
         }
       }
     } else if (stmt.type === 'AssignmentStatement') {
@@ -230,80 +292,108 @@ export function compileToLuauVM(
         }
         if (v.type === 'Identifier') {
           if (localRegs.has(v.name)) {
-            emit('OP_MOVE', localRegs.get(v.name)!, valReg, 0);
+            emit('MOVE', localRegs.get(v.name)!, valReg, 0);
           } else {
             const kIdx = addConstant(v.name);
-            emit('OP_SETGLOBAL', valReg, kIdx, 0);
+            emit('SETGLOBAL', valReg, kIdx, 0);
           }
         } else if (v.type === 'MemberExpression') {
           const baseReg = allocReg();
           compileExpression(v.base, baseReg);
-          const kIdx = addConstant(v.identifier.name);
-          emit('OP_SETTABLE', baseReg, kIdx, valReg);
+          const propIdx = addConstant(v.identifier.name);
+          emit('SETTABLE_K', baseReg, propIdx, valReg);
         } else if (v.type === 'IndexExpression') {
           const baseReg = allocReg();
           compileExpression(v.base, baseReg);
-          const keyReg = allocReg();
-          compileExpression(v.index, keyReg);
-          emit('OP_SETTABLE', baseReg, keyReg, valReg);
+          const kReg = allocReg();
+          compileExpression(v.index, kReg);
+          emit('SETTABLE_R', baseReg, kReg, valReg);
         }
       }
+    } else if (stmt.type === 'IfStatement') {
+      const exitJumps: number[] = [];
+      for (let c = 0; c < stmt.clauses.length; c++) {
+        const clause = stmt.clauses[c];
+        let jmpNotIdx = -1;
+        if (clause.condition) {
+          const condReg = allocReg();
+          compileExpression(clause.condition, condReg);
+          jmpNotIdx = emit('JMPIFNOT', condReg, 0, 0);
+        }
+
+        for (const s of clause.body) {
+          compileStatement(s);
+        }
+
+        if (c < stmt.clauses.length - 1) {
+          exitJumps.push(emit('JMP', 0, 0, 0));
+        }
+
+        if (jmpNotIdx !== -1) {
+          rawInstructions[jmpNotIdx][2] = rawInstructions.length - jmpNotIdx - 1;
+        }
+      }
+
+      for (const ej of exitJumps) {
+        rawInstructions[ej][2] = rawInstructions.length - ej - 1;
+      }
+    } else if (stmt.type === 'WhileStatement') {
+      const startPc = rawInstructions.length;
+      const condReg = allocReg();
+      compileExpression(stmt.condition, condReg);
+      const jmpOut = emit('JMPIFNOT', condReg, 0, 0);
+
+      for (const s of stmt.body) {
+        compileStatement(s);
+      }
+
+      const loopJmp = emit('JMP', 0, 0, 0);
+      rawInstructions[loopJmp][2] = startPc - loopJmp - 1;
+      rawInstructions[jmpOut][2] = rawInstructions.length - jmpOut - 1;
+    } else if (stmt.type === 'ForNumericStatement') {
+      const varName = stmt.variable.name;
+      const baseR = allocReg();
+      compileExpression(stmt.start, baseR);
+      const limitR = allocReg();
+      compileExpression(stmt.end, limitR);
+      const stepR = allocReg();
+      if (stmt.step) compileExpression(stmt.step, stepR);
+      else emit('LOADK', stepR, addConstant(1), 0);
+
+      const extVarR = allocReg();
+      localRegs.set(varName, extVarR);
+
+      const prepIdx = emit('FORPREP', baseR, 0, extVarR);
+      const bodyStart = rawInstructions.length;
+
+      for (const s of stmt.body) {
+        compileStatement(s);
+      }
+
+      const loopIdx = emit('FORLOOP', baseR, 0, extVarR);
+      rawInstructions[prepIdx][2] = loopIdx - prepIdx;
+      rawInstructions[loopIdx][2] = loopIdx - bodyStart + 1;
     } else if (stmt.type === 'ReturnStatement') {
       if (stmt.arguments && stmt.arguments.length > 0) {
         const retReg = allocReg();
         compileExpression(stmt.arguments[0], retReg);
-        emit('OP_RETURN', retReg, 1, 0);
+        emit('RETURN', retReg, 1, 0);
       } else {
-        emit('OP_RETURN', 0, 0, 0);
+        emit('RETURN', 0, 0, 0);
       }
-    } else if (stmt.type === 'ForNumericStatement') {
-      const varName = stmt.variable.name;
-      const varReg = allocReg();
-      localRegs.set(varName, varReg);
-
-      compileExpression(stmt.start, varReg);
-      const limitReg = allocReg();
-      compileExpression(stmt.end, limitReg);
-      const stepReg = allocReg();
-      if (stmt.step) {
-        compileExpression(stmt.step, stepReg);
-      } else {
-        emit('OP_LOADK', stepReg, addConstant(1), 0);
+    } else if (stmt.type === 'DoStatement') {
+      for (const s of stmt.body) {
+        compileStatement(s);
       }
-
-      const prepPcIndex = rawInstructions.length;
-      emit('OP_FORPREP', varReg, 0, 0);
-
-      const bodyStartPc = rawInstructions.length;
-      if (Array.isArray(stmt.body)) {
-        for (const s of stmt.body) {
-          compileStatement(s);
-        }
+    } else if (stmt.type === 'RepeatStatement') {
+      const startPc = rawInstructions.length;
+      for (const s of stmt.body) {
+        compileStatement(s);
       }
-
-      const loopPcIndex = rawInstructions.length;
-      emit('OP_FORLOOP', varReg, bodyStartPc, 0);
-      const totalLoopSpan = loopPcIndex - prepPcIndex;
-      rawInstructions[prepPcIndex][2] = totalLoopSpan;
-    } else if (stmt.type === 'IfStatement') {
-      for (const clause of stmt.clauses) {
-        const condReg = allocReg();
-        if (clause.condition) {
-          compileExpression(clause.condition, condReg);
-        }
-        const jmpIfIndex = rawInstructions.length;
-        if (clause.condition) {
-          emit('OP_JMPIF', condReg, 0, 0);
-        }
-        if (Array.isArray(clause.body)) {
-          for (const s of clause.body) {
-            compileStatement(s);
-          }
-        }
-        if (clause.condition) {
-          rawInstructions[jmpIfIndex][2] = rawInstructions.length - jmpIfIndex;
-        }
-      }
+      const condReg = allocReg();
+      compileExpression(stmt.condition, condReg);
+      const repJmp = emit('JMPIFNOT', condReg, 0, 0);
+      rawInstructions[repJmp][2] = startPc - repJmp - 1;
     }
   }
 
@@ -311,18 +401,18 @@ export function compileToLuauVM(
     compileStatement(stmt);
   }
 
-  emit('OP_RETURN', 0, 0, 0);
+  emit('RETURN', 0, 0, 0);
 
-  // 2. Serialize Bytecode + Constants into BZ Payload
+  // 2. Serialize Bytecode + Constants into Binary Bytes
   const serializedBytes: number[] = [];
 
-  // Pack instruction length (2 bytes)
+  // Pack instruction count (2 bytes)
   const instCount = rawInstructions.length;
   serializedBytes.push((instCount >> 8) & 0xff, instCount & 0xff);
 
   // Pack raw instructions [op, a, b, c]
   for (const [op, a, b, c] of rawInstructions) {
-    serializedBytes.push(op & 0xff, a & 0xff, b & 0xff, c & 0xff);
+    serializedBytes.push(op & 0xff, a & 0xff, (b >= 0 ? b : 256 + (b % 256)) & 0xff, c & 0xff);
   }
 
   // Pack constants length (2 bytes)
@@ -331,7 +421,7 @@ export function compileToLuauVM(
 
   // Pack serialized constants
   for (const c of constants) {
-    if (c === null) {
+    if (c === null || c === undefined) {
       serializedBytes.push(0); // type 0 = nil
     } else if (typeof c === 'boolean') {
       serializedBytes.push(1, c ? 1 : 0); // type 1 = boolean
@@ -354,7 +444,7 @@ export function compileToLuauVM(
     }
   }
 
-  // RC4-like + 16-bit float-safe LCG Keystream Encryption over serialized bytes
+  // 3. RC4-like + 16-bit Float-Safe LCG Keystream Encryption
   const rc4S = Array.from({ length: 256 }, (_, i) => i);
   let j = 0;
   const keyByte = seed % 256;
@@ -384,34 +474,56 @@ export function compileToLuauVM(
   // Format BZ payload string with strict 3-digit decimal escape padding
   const bzPayloadStr = encryptedBZBytes.map((b) => `\\${b.toString().padStart(3, '0')}`).join('');
 
-
-  // 3. Build F-Table Loader Wrapper (F[127] for VM dispatcher, F[32]/F[62] for Decoders, gZ for stream reader)
-  const opLoadk = opMap.get('OP_LOADK');
-  const opGetglobal = opMap.get('OP_GETGLOBAL');
-  const opSetglobal = opMap.get('OP_SETGLOBAL');
-  const opMove = opMap.get('OP_MOVE');
-  const opCall = opMap.get('OP_CALL');
-  const opBinop = opMap.get('OP_BINOP');
-  const opNewtable = opMap.get('OP_NEWTABLE');
-  const opGettable = opMap.get('OP_GETTABLE');
-  const opSettable = opMap.get('OP_SETTABLE');
-  const opReturn = opMap.get('OP_RETURN');
-  const opForprep = opMap.get('OP_FORPREP');
-  const opForloop = opMap.get('OP_FORLOOP');
-  const opJmpif = opMap.get('OP_JMPIF');
-
+  // 4. Build F-Table Loader Wrapper (Luraph Architecture)
   const randTag = Math.random().toString(36).substring(2, 6);
   const bzVar = `_bz_${randTag}`;
   const fTableVar = `F_${randTag}`;
   const gzVar = `gZ_${randTag}`;
 
+  const opLoadk = opMap.get('LOADK');
+  const opLoadnil = opMap.get('LOADNIL');
+  const opLoadbool = opMap.get('LOADBOOL');
+  const opMove = opMap.get('MOVE');
+  const opGetglobal = opMap.get('GETGLOBAL');
+  const opSetglobal = opMap.get('SETGLOBAL');
+  const opNewtable = opMap.get('NEWTABLE');
+  const opGettableK = opMap.get('GETTABLE_K');
+  const opGettableR = opMap.get('GETTABLE_R');
+  const opSettableK = opMap.get('SETTABLE_K');
+  const opSettableR = opMap.get('SETTABLE_R');
+  const opAdd = opMap.get('ADD');
+  const opSub = opMap.get('SUB');
+  const opMul = opMap.get('MUL');
+  const opDiv = opMap.get('DIV');
+  const opMod = opMap.get('MOD');
+  const opPow = opMap.get('POW');
+  const opConcat = opMap.get('CONCAT');
+  const opEq = opMap.get('EQ');
+  const opNeq = opMap.get('NEQ');
+  const opLt = opMap.get('LT');
+  const opLe = opMap.get('LE');
+  const opGt = opMap.get('GT');
+  const opGe = opMap.get('GE');
+  const opAnd = opMap.get('AND');
+  const opOr = opMap.get('OR');
+  const opUnm = opMap.get('UNM');
+  const opNot = opMap.get('NOT');
+  const opLen = opMap.get('LEN');
+  const opCall = opMap.get('CALL');
+  const opReturn = opMap.get('RETURN');
+  const opJmp = opMap.get('JMP');
+  const opJmpif = opMap.get('JMPIF');
+  const opJmpifnot = opMap.get('JMPIFNOT');
+  const opForprep = opMap.get('FORPREP');
+  const opForloop = opMap.get('FORLOOP');
+
   const vmLoaderScript = `local ${bzVar} = "${bzPayloadStr}"
 local ${fTableVar} = {}
 
-${fTableVar}[32] = function(b, k)
-    local i, j = 0, 0
+${fTableVar}[32] = function(bz, k)
     local s = {}
     for idx = 0, 255 do s[idx] = idx end
+    local j = 0
     local kb = (k % 256)
     for idx = 0, 255 do
         j = (j + s[idx] + kb + (idx * 37)) % 256
@@ -452,7 +564,6 @@ ${fTableVar}[62] = function(bz, k, s)
     return res
 end
 
-
 ${fTableVar}[5] = function(decBytes)
     local pos = 1
     local function r8()
@@ -469,7 +580,9 @@ ${fTableVar}[5] = function(decBytes)
     local numInst = r16()
     local insts = {}
     for i = 1, numInst do
-        insts[i] = {r8(), r8(), r8(), r8()}
+        local o, a, b, c = r8(), r8(), r8(), r8()
+        if b > 127 then b = b - 256 end
+        insts[i] = {o, a, b, c}
     end
     
     local numK = r16()
@@ -498,66 +611,90 @@ end
 ${fTableVar}[127] = function(insts, ks)
     local stk = {}
     local pc = 1
-    local env = (type(getfenv) == "function" and getfenv()) or _G
+    local _e = (type(getfenv) == "function" and getfenv()) or (type(_G) == "table" and _G)
+    local prx = setmetatable({}, {
+        __index = function(_, k)
+            if _e then return _e[k] end
+            return nil
+        end,
+        __newindex = function(_, k, v)
+            if _e then _e[k] = v end
+        end
+    })
     local unp = unpack or table.unpack
     
     while pc <= #insts do
         local inst = insts[pc]
-        local op, a, b, c = inst[1], inst[2], inst[3], inst[4]
+        local o, a, b, c = inst[1], inst[2], inst[3], inst[4]
         
-        if op == ${opLoadk} then
+        if o == ${opLoadk} then
             stk[a] = ks[b]
-        elseif op == ${opGetglobal} then
-            stk[a] = env[ks[b]]
-        elseif op == ${opSetglobal} then
-            env[ks[b]] = stk[a]
-        elseif op == ${opMove} then
+        elseif o == ${opLoadnil} then
+            stk[a] = nil
+        elseif o == ${opLoadbool} then
+            stk[a] = (b == 1)
+        elseif o == ${opMove} then
             stk[a] = stk[b]
-        elseif op == ${opCall} then
+        elseif o == ${opGetglobal} then
+            stk[a] = prx[ks[b]]
+        elseif o == ${opSetglobal} then
+            prx[ks[b]] = stk[a]
+        elseif o == ${opNewtable} then
+            stk[a] = {}
+        elseif o == ${opGettableK} then
+            stk[a] = stk[b][ks[c]]
+        elseif o == ${opGettableR} then
+            stk[a] = stk[b][stk[c]]
+        elseif o == ${opSettableK} then
+            stk[a][ks[b]] = stk[c]
+        elseif o == ${opSettableR} then
+            stk[a][stk[b]] = stk[c]
+        elseif o == ${opAdd} then stk[a] = stk[b] + stk[c]
+        elseif o == ${opSub} then stk[a] = stk[b] - stk[c]
+        elseif o == ${opMul} then stk[a] = stk[b] * stk[c]
+        elseif o == ${opDiv} then stk[a] = stk[b] / stk[c]
+        elseif o == ${opMod} then stk[a] = stk[b] % stk[c]
+        elseif o == ${opPow} then stk[a] = stk[b] ^ stk[c]
+        elseif o == ${opConcat} then stk[a] = tostring(stk[b]) .. tostring(stk[c])
+        elseif o == ${opEq} then stk[a] = (stk[b] == stk[c])
+        elseif o == ${opNeq} then stk[a] = (stk[b] ~= stk[c])
+        elseif o == ${opLt} then stk[a] = (stk[b] < stk[c])
+        elseif o == ${opLe} then stk[a] = (stk[b] <= stk[c])
+        elseif o == ${opGt} then stk[a] = (stk[b] > stk[c])
+        elseif o == ${opGe} then stk[a] = (stk[b] >= stk[c])
+        elseif o == ${opAnd} then stk[a] = (stk[b] and stk[c])
+        elseif o == ${opOr} then stk[a] = (stk[b] or stk[c])
+        elseif o == ${opUnm} then stk[a] = -stk[b]
+        elseif o == ${opNot} then stk[a] = not stk[b]
+        elseif o == ${opLen} then stk[a] = #stk[b]
+        elseif o == ${opCall} then
             local fn = stk[a]
             if type(fn) == "function" then
                 local args = {}
-                for idx = 1, c do args[idx] = stk[a + idx] end
-                local res = fn(unp(args, 1, c))
-                stk[b] = res
+                for idx = 1, b do args[idx] = stk[a + idx] end
+                local res = fn(unp(args, 1, b))
+                stk[c] = res
             end
-        elseif op == ${opBinop} then
-            local opStr = ks[c] or "+"
-            local v1, v2 = stk[a], stk[b]
-            if opStr == "+" then stk[a] = v1 + v2
-            elseif opStr == "-" then stk[a] = v1 - v2
-            elseif opStr == "*" then stk[a] = v1 * v2
-            elseif opStr == "/" then stk[a] = v1 / v2
-            elseif opStr == ".." then stk[a] = tostring(v1) .. tostring(v2)
-            elseif opStr == "==" then stk[a] = (v1 == v2)
-            end
-        elseif op == ${opNewtable} then
-            stk[a] = {}
-        elseif op == ${opGettable} then
-            local tbl = stk[b]
-            if type(tbl) == "table" or type(tbl) == "userdata" then
-                stk[a] = tbl[ks[c]]
-            end
-        elseif op == ${opSettable} then
-            local tbl = stk[a]
-            if type(tbl) == "table" then
-                tbl[ks[b]] = stk[c]
-            end
-        elseif op == ${opForprep} then
-            stk[a] = stk[a] - stk[a + 2]
+        elseif o == ${opJmp} then
             pc = pc + b
-        elseif op == ${opForloop} then
+        elseif o == ${opJmpif} then
+            if stk[a] then pc = pc + b end
+        elseif o == ${opJmpifnot} then
+            if not stk[a] then pc = pc + b end
+        elseif o == ${opForprep} then
+            stk[c] = stk[a]
             local step = stk[a + 2]
-            local count = stk[a] + step
-            stk[a] = count
-            if (step > 0 and count <= stk[a + 1]) or (step < 0 and count >= stk[a + 1]) then
-                pc = pc - b
-            end
-        elseif op == ${opJmpif} then
-            if stk[a] then
+            if (step > 0 and stk[a] > stk[a + 1]) or (step < 0 and stk[a] < stk[a + 1]) then
                 pc = pc + b
             end
-        elseif op == ${opReturn} then
+        elseif o == ${opForloop} then
+            local step = stk[a + 2]
+            local nextVal = stk[c] + step
+            if (step > 0 and nextVal <= stk[a + 1]) or (step < 0 and nextVal >= stk[a + 1]) then
+                stk[c] = nextVal
+                pc = pc - b
+            end
+        elseif o == ${opReturn} then
             if b > 0 then return stk[a] end
             return
         end
@@ -566,6 +703,11 @@ ${fTableVar}[127] = function(insts, ks)
 end
 
 local function ${gzVar}()
+    local _s = (function()
+        local t = math.floor(os.clock() * 1e6)
+        local addr = tonumber(tostring({}):match("0x%x+")) or 0
+        return (t + addr) % 4294967296
+    end)()
     local sTable = ${fTableVar}[32](${bzVar}, ${seed})
     local dec = ${fTableVar}[62](${bzVar}, ${seed}, sTable)
     local insts, ks = ${fTableVar}[5](dec)
@@ -582,4 +724,3 @@ ${gzVar}()
     constantCount: constants.length,
   };
 }
-

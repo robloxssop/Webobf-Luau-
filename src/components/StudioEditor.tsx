@@ -92,7 +92,7 @@ export const StudioEditor: React.FC<StudioEditorProps> = ({
     const options: ObfuscationOptions = {
       profile,
       preset: 'luraph',
-      mode: 'direct_luau',
+      mode: 'luau_vm',
       stringEncoding: 'byte_array',
       identifierRenaming: true,
       barcodeRenaming: true,

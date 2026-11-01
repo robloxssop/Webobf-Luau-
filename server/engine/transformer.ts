@@ -674,13 +674,14 @@ export function obfuscateLua(
 
   if (mode === 'luau_vm') {
     // Pure-Luau Bytecode Virtual Machine mode (Zero loadstring, Roblox Studio compatible)
-    const vmRes = compileToLuauVM(sourceCode, {
+    const sanitizedInput = sanitizeLuauSyntax(sourceCode).sanitized;
+    const vmRes = compileToLuauVM(sanitizedInput, {
       seed: options.seed || prng.nextInt(1, 255),
       antiTamper: applyAntiTamper,
     });
 
     if (vmRes.success) {
-      finalOutput = preludeLines.join('\n') + '\n\n' + vmRes.code;
+      finalOutput = vmRes.code;
       diagnostics.push({
         phase: 'Transformation',
         severity: 'info',
