@@ -1,39 +1,61 @@
 import * as luaparse from 'luaparse';
 
+export interface VMSessionData {
+  maskedKParams: number[];
+  encryptedPayload: number[];
+  authA: number;
+  authB: number;
+}
+
 export interface VMCompilationResult {
   success: boolean;
   code: string;
   instructionCount: number;
   constantCount: number;
   error?: string;
-  externalPayloadUrl?: string;
-  rawPayload?: string;
+  sessionData?: VMSessionData;
 }
 
 /**
  * Senior Architect Commercial Luau / Lua 5.1 Bytecode Virtual Machine Obfuscator.
  *
- * Upgraded Features:
- * 1. Control Flow Flattening (CFF) State Machine:
- *    - Transformed key derivation (_derive_keys) and stream decryption into non-linear,
- *      state-interleaved dispatcher loops with randomized state IDs and jumbled block layouts.
- * 2. Deep State Entanglement:
- *    - Interleaved state-driven key updates and byte unmasking.
- * 3. Polymorphic VM Architecture:
- *    - Fully randomized opcode mapping, 24-permutation field layout, dynamic hashing formulas per build.
- * 4. External / Server-Side Payload Fetching Option:
- *    - Move byte payload (_bz) out of script to host externally via HTTP fetch at runtime (game:HttpGet).
- * 5. Scope Virtualization:
- *    - 100% environment isolation mapping _G and shared to proxy frame.
+ * SECURITY NOTE:
+ * - externalPayload mode is now MANDATORY. Inline payload = 30s deobfuscation.
+ * - User MUST provide serverBaseUrl + sessionToken.
+ * - After compile, user MUST register sessionData on their server with the same token.
  */
 export function compileToLuauVM(
   sourceCode: string,
   options: {
     seed?: number;
     antiTamper?: boolean;
-    externalPayloadUrl?: string;
-  } = {}
+    serverBaseUrl: string;
+    sessionToken: string;
+  }
 ): VMCompilationResult {
+  // ─── [SECURITY GATE] Force external payload mode ─────────────────────
+  if (
+    !options ||
+    typeof options.serverBaseUrl !== 'string' ||
+    options.serverBaseUrl.trim().length === 0 ||
+    typeof options.sessionToken !== 'string' ||
+    options.sessionToken.trim().length === 0
+  ) {
+    return {
+      success: false,
+      code: '',
+      instructionCount: 0,
+      constantCount: 0,
+      error:
+        'SECURITY REQUIREMENT: serverBaseUrl and sessionToken are mandatory. ' +
+        'Inline payload mode is disabled (would allow 30s deobfuscation).',
+    };
+  }
+
+  const serverBaseUrl = options.serverBaseUrl.trim().replace(/\/+$/, '');
+  const sessionToken = options.sessionToken.trim();
+  const fullSessionUrl = `${serverBaseUrl}/${sessionToken}`;
+
   const seed = (options.seed ?? Math.floor(Math.random() * 0xffffffff)) >>> 0;
 
   let ast: any;
@@ -56,55 +78,23 @@ export function compileToLuauVM(
   }
 
   const baseOpcodes = [
-    'LOADK',
-    'LOADNIL',
-    'LOADBOOL',
-    'MOVE',
-    'GETGLOBAL',
-    'SETGLOBAL',
-    'NEWTABLE',
-    'GETTABLE_K',
-    'GETTABLE_R',
-    'SETTABLE_K',
-    'SETTABLE_R',
-    'ADD',
-    'SUB',
-    'MUL',
-    'DIV',
-    'MOD',
-    'POW',
-    'CONCAT',
-    'EQ',
-    'NEQ',
-    'LT',
-    'LE',
-    'GT',
-    'GE',
-    'AND',
-    'OR',
-    'UNM',
-    'NOT',
-    'LEN',
-    'CALL',
-    'RETURN',
-    'JMP',
-    'JMPIF',
-    'JMPIFNOT',
-    'FORPREP',
-    'FORLOOP',
+    'LOADK', 'LOADNIL', 'LOADBOOL', 'MOVE', 'GETGLOBAL', 'SETGLOBAL', 'NEWTABLE',
+    'GETTABLE_K', 'GETTABLE_R', 'SETTABLE_K', 'SETTABLE_R',
+    'ADD', 'SUB', 'MUL', 'DIV', 'MOD', 'POW', 'CONCAT',
+    'EQ', 'NEQ', 'LT', 'LE', 'GT', 'GE', 'AND', 'OR',
+    'UNM', 'NOT', 'LEN', 'CALL', 'RETURN',
+    'JMP', 'JMPIF', 'JMPIFNOT', 'FORPREP', 'FORLOOP',
   ];
 
-  // 1. PRNG Initialization
   let prngState = seed ^ 0x5a5a5a5a;
   const lcgNext = () => {
     prngState = (Math.imul(1103515245, prngState) + 12345) >>> 0;
     return prngState;
   };
 
-  // Helper for random identifier generation
-  const randIdent = (prefix: string) => `${prefix}_${(lcgNext() % 0xffff).toString(36)}${Math.random().toString(36).substring(2, 5)}`;
+  const randIdent = (prefix: string) =>
+    `${prefix}_${(lcgNext() % 0xffff).toString(36)}${Math.random().toString(36).substring(2, 5)}`;
 
-  // Polymorphic Identifiers
   const bzVar = randIdent('_bz');
   const fTableVar = randIdent('_F');
   const gzVar = randIdent('_gZ');
@@ -116,26 +106,20 @@ export function compileToLuauVM(
   const pcVar = randIdent('_pc');
   const cycleVar = randIdent('_cyc');
 
-  // Polymorphic Function Table Slots
   const slotAuthFn = (lcgNext() % 450) + 10;
   const slotSBoxFn = (lcgNext() % 450) + 460;
   const slotDecryptFn = (lcgNext() % 450) + 920;
   const slotDeserializerFn = (lcgNext() % 450) + 1380;
   const slotExecEngineFn = (lcgNext() % 450) + 1840;
 
-  // 2. Polymorphic Opcode Shuffling & Dynamic Hashing Formula
   const opMap = new Map<string, number>();
   const shuffledOps = [...baseOpcodes];
-
   for (let i = shuffledOps.length - 1; i > 0; i--) {
     const j = lcgNext() % (i + 1);
     [shuffledOps[i], shuffledOps[j]] = [shuffledOps[j], shuffledOps[i]];
   }
-
   const opcodeBase = (lcgNext() % 70) + 15;
-  shuffledOps.forEach((opName, idx) => {
-    opMap.set(opName, opcodeBase + idx);
-  });
+  shuffledOps.forEach((opName, idx) => opMap.set(opName, opcodeBase + idx));
 
   const opHashMult = (lcgNext() % 89) * 2 + 11;
   const opHashAdd = (lcgNext() % 983) + 17;
@@ -146,7 +130,6 @@ export function compileToLuauVM(
     return ((((rawOp * opHashMult + opHashAdd) % opHashMod) ^ opHashXor) >>> 0);
   }
 
-  // 3. Full 24 Permutations Instruction Field Layout Scrambling
   function getPermutations(arr: number[]): number[][] {
     if (arr.length <= 1) return [arr];
     const result: number[][] = [];
@@ -165,13 +148,10 @@ export function compileToLuauVM(
   const bPos = fieldLayout[2];
   const cPos = fieldLayout[3];
 
-  // 4. Separated Constant Storage Pools
   const numConstants: number[] = [];
   const numConstMap = new Map<number, number>();
-
   const strConstants: string[] = [];
   const strConstMap = new Map<string, number>();
-
   const boolConstants: boolean[] = [];
   const boolConstMap = new Map<boolean, number>();
 
@@ -182,7 +162,6 @@ export function compileToLuauVM(
     numConstMap.set(val, idx);
     return idx;
   }
-
   function addStrConstant(val: string): number {
     if (strConstMap.has(val)) return strConstMap.get(val)!;
     const idx = strConstants.length + 1;
@@ -190,7 +169,6 @@ export function compileToLuauVM(
     strConstMap.set(val, idx);
     return idx;
   }
-
   function addBoolConstant(val: boolean): number {
     if (boolConstMap.has(val)) return boolConstMap.get(val)!;
     const idx = boolConstants.length + 1;
@@ -200,44 +178,27 @@ export function compileToLuauVM(
   }
 
   const referencedGlobals = new Set<string>();
-
   function collectAstGlobals(node: any, locals: Set<string>) {
     if (!node || typeof node !== 'object') return;
     if (node.type === 'LocalStatement') {
-      for (const v of node.variables || []) {
-        if (v && v.name) locals.add(v.name);
-      }
+      for (const v of node.variables || []) if (v?.name) locals.add(v.name);
     } else if (node.type === 'FunctionDeclaration') {
-      if (node.isLocal && node.identifier?.name) {
-        locals.add(node.identifier.name);
-      } else if (node.identifier?.name) {
-        referencedGlobals.add(node.identifier.name);
-      }
-      for (const param of node.parameters || []) {
-        if (param && param.name) locals.add(param.name);
-      }
+      if (node.isLocal && node.identifier?.name) locals.add(node.identifier.name);
+      else if (node.identifier?.name) referencedGlobals.add(node.identifier.name);
+      for (const param of node.parameters || []) if (param?.name) locals.add(param.name);
     } else if (node.type === 'Identifier') {
-      if (!locals.has(node.name)) {
-        referencedGlobals.add(node.name);
-      }
+      if (!locals.has(node.name)) referencedGlobals.add(node.name);
     }
     for (const key of Object.keys(node)) {
       if (key === 'loc' || key === 'range') continue;
       const child = node[key];
-      if (Array.isArray(child)) {
-        for (const item of child) {
-          collectAstGlobals(item, locals);
-        }
-      } else if (child && typeof child === 'object') {
-        collectAstGlobals(child, locals);
-      }
+      if (Array.isArray(child)) for (const item of child) collectAstGlobals(item, locals);
+      else if (child && typeof child === 'object') collectAstGlobals(child, locals);
     }
   }
-
   collectAstGlobals(ast, new Set());
 
   const rawInstructions: [number, number, number, number][] = [];
-
   function emit(op: string, a = 0, b = 0, c = 0): number {
     const opCode = opMap.get(op) || 0;
     rawInstructions.push([opCode, a, b, c]);
@@ -246,64 +207,38 @@ export function compileToLuauVM(
 
   const localRegs = new Map<string, number>();
   let nextReg = 0;
-
-  function allocReg(): number {
-    return nextReg++;
-  }
+  function allocReg(): number { return nextReg++; }
 
   function compileExpression(node: any, targetReg: number) {
     if (!node) return;
-
     if (node.type === 'StringLiteral') {
       let strVal = '';
-      if (typeof node.raw === 'string' && (node.raw.startsWith('"') || node.raw.startsWith("'"))) {
+      if (typeof node.raw === 'string' && (node.raw.startsWith('"') || node.raw.startsWith("'")))
         strVal = node.raw.slice(1, -1);
-      } else {
-        strVal = node.value ?? '';
-      }
-      const kIdx = addStrConstant(strVal);
-      emit('LOADK', targetReg, kIdx, 3);
+      else strVal = node.value ?? '';
+      emit('LOADK', targetReg, addStrConstant(strVal), 3);
     } else if (node.type === 'NumericLiteral') {
-      const kIdx = addNumConstant(node.value);
-      emit('LOADK', targetReg, kIdx, 2);
+      emit('LOADK', targetReg, addNumConstant(node.value), 2);
     } else if (node.type === 'BooleanLiteral') {
-      const kIdx = addBoolConstant(node.value);
-      emit('LOADK', targetReg, kIdx, 1);
+      emit('LOADK', targetReg, addBoolConstant(node.value), 1);
     } else if (node.type === 'NilLiteral') {
       emit('LOADNIL', targetReg, 0, 0);
     } else if (node.type === 'Identifier') {
-      if (localRegs.has(node.name)) {
-        emit('MOVE', targetReg, localRegs.get(node.name)!, 0);
-      } else {
+      if (localRegs.has(node.name)) emit('MOVE', targetReg, localRegs.get(node.name)!, 0);
+      else {
         referencedGlobals.add(node.name);
-        const kIdx = addStrConstant(node.name);
-        emit('GETGLOBAL', targetReg, kIdx, 0);
+        emit('GETGLOBAL', targetReg, addStrConstant(node.name), 0);
       }
     } else if (node.type === 'BinaryExpression' || node.type === 'LogicalExpression') {
-      const regL = allocReg();
-      const regR = allocReg();
+      const regL = allocReg(), regR = allocReg();
       compileExpression(node.left, regL);
       compileExpression(node.right, regR);
-
       const binMap: Record<string, string> = {
-        '+': 'ADD',
-        '-': 'SUB',
-        '*': 'MUL',
-        '/': 'DIV',
-        '%': 'MOD',
-        '^': 'POW',
-        '..': 'CONCAT',
-        '==': 'EQ',
-        '~=': 'NEQ',
-        '<': 'LT',
-        '<=': 'LE',
-        '>': 'GT',
-        '>=': 'GE',
-        'and': 'AND',
-        'or': 'OR',
+        '+': 'ADD', '-': 'SUB', '*': 'MUL', '/': 'DIV', '%': 'MOD', '^': 'POW',
+        '..': 'CONCAT', '==': 'EQ', '~=': 'NEQ', '<': 'LT', '<=': 'LE',
+        '>': 'GT', '>=': 'GE', 'and': 'AND', 'or': 'OR',
       };
-      const opName = binMap[node.operator] || 'ADD';
-      emit(opName, targetReg, regL, regR);
+      emit(binMap[node.operator] || 'ADD', targetReg, regL, regR);
     } else if (node.type === 'UnaryExpression') {
       const regA = allocReg();
       compileExpression(node.argument, regA);
@@ -315,12 +250,10 @@ export function compileToLuauVM(
     } else if (node.type === 'MemberExpression') {
       const baseReg = allocReg();
       compileExpression(node.base, baseReg);
-      const propIdx = addStrConstant(node.identifier.name);
-      emit('GETTABLE_K', targetReg, baseReg, propIdx);
+      emit('GETTABLE_K', targetReg, baseReg, addStrConstant(node.identifier.name));
     } else if (node.type === 'IndexExpression') {
-      const baseReg = allocReg();
+      const baseReg = allocReg(), idxReg = allocReg();
       compileExpression(node.base, baseReg);
-      const idxReg = allocReg();
       compileExpression(node.index, idxReg);
       emit('GETTABLE_R', targetReg, baseReg, idxReg);
     } else if (node.type === 'TableConstructorExpression') {
@@ -336,9 +269,8 @@ export function compileToLuauVM(
           compileExpression(field.value, valReg);
           emit('SETTABLE_K', targetReg, addStrConstant(field.key.name), valReg);
         } else if (field.type === 'TableKey') {
-          const keyReg = allocReg();
+          const keyReg = allocReg(), valReg = allocReg();
           compileExpression(field.key, keyReg);
-          const valReg = allocReg();
           compileExpression(field.value, valReg);
           emit('SETTABLE_R', targetReg, keyReg, valReg);
         }
@@ -348,28 +280,20 @@ export function compileToLuauVM(
 
   function compileCall(node: any, targetReg: number) {
     const fnReg = allocReg();
-
     if (node.base.type === 'MemberExpression' && node.base.indexer === ':') {
       const objReg = allocReg();
       compileExpression(node.base.base, objReg);
-      const methodIdx = addStrConstant(node.base.identifier.name);
-      emit('GETTABLE_K', fnReg, objReg, methodIdx);
-
+      emit('GETTABLE_K', fnReg, objReg, addStrConstant(node.base.identifier.name));
       const argRegs: number[] = [objReg];
       for (const arg of node.arguments) {
         const aReg = allocReg();
         compileExpression(arg, aReg);
         argRegs.push(aReg);
       }
-
-      for (let i = 0; i < argRegs.length; i++) {
-        emit('MOVE', fnReg + 1 + i, argRegs[i], 0);
-      }
-
+      for (let i = 0; i < argRegs.length; i++) emit('MOVE', fnReg + 1 + i, argRegs[i], 0);
       emit('CALL', fnReg, argRegs.length, targetReg);
       return;
     }
-
     compileExpression(node.base, fnReg);
     const argRegs: number[] = [];
     for (const arg of node.arguments) {
@@ -377,58 +301,40 @@ export function compileToLuauVM(
       compileExpression(arg, aReg);
       argRegs.push(aReg);
     }
-
-    for (let i = 0; i < argRegs.length; i++) {
-      emit('MOVE', fnReg + 1 + i, argRegs[i], 0);
-    }
-
+    for (let i = 0; i < argRegs.length; i++) emit('MOVE', fnReg + 1 + i, argRegs[i], 0);
     emit('CALL', fnReg, argRegs.length, targetReg);
   }
 
   function compileStatement(stmt: any) {
     if (!stmt) return;
-
     if (stmt.type === 'CallStatement') {
-      const dummy = allocReg();
-      compileCall(stmt.expression, dummy);
+      compileCall(stmt.expression, allocReg());
     } else if (stmt.type === 'LocalStatement') {
       const regsToAssign: { reg: number; initExpr: any }[] = [];
       for (let i = 0; i < stmt.variables.length; i++) {
-        const v = stmt.variables[i];
         const r = allocReg();
-        localRegs.set(v.name, r);
+        localRegs.set(stmt.variables[i].name, r);
         regsToAssign.push({ reg: r, initExpr: stmt.init ? stmt.init[i] : null });
       }
       for (const item of regsToAssign) {
-        if (item.initExpr) {
-          compileExpression(item.initExpr, item.reg);
-        } else {
-          emit('LOADNIL', item.reg, 0, 0);
-        }
+        if (item.initExpr) compileExpression(item.initExpr, item.reg);
+        else emit('LOADNIL', item.reg, 0, 0);
       }
     } else if (stmt.type === 'AssignmentStatement') {
       for (let i = 0; i < stmt.variables.length; i++) {
         const v = stmt.variables[i];
         const valReg = allocReg();
-        if (stmt.init && stmt.init[i]) {
-          compileExpression(stmt.init[i], valReg);
-        }
+        if (stmt.init && stmt.init[i]) compileExpression(stmt.init[i], valReg);
         if (v.type === 'Identifier') {
-          if (localRegs.has(v.name)) {
-            emit('MOVE', localRegs.get(v.name)!, valReg, 0);
-          } else {
-            const kIdx = addStrConstant(v.name);
-            emit('SETGLOBAL', valReg, kIdx, 0);
-          }
+          if (localRegs.has(v.name)) emit('MOVE', localRegs.get(v.name)!, valReg, 0);
+          else emit('SETGLOBAL', valReg, addStrConstant(v.name), 0);
         } else if (v.type === 'MemberExpression') {
           const baseReg = allocReg();
           compileExpression(v.base, baseReg);
-          const propIdx = addStrConstant(v.identifier.name);
-          emit('SETTABLE_K', baseReg, propIdx, valReg);
+          emit('SETTABLE_K', baseReg, addStrConstant(v.identifier.name), valReg);
         } else if (v.type === 'IndexExpression') {
-          const baseReg = allocReg();
+          const baseReg = allocReg(), kReg = allocReg();
           compileExpression(v.base, baseReg);
-          const kReg = allocReg();
           compileExpression(v.index, kReg);
           emit('SETTABLE_R', baseReg, kReg, valReg);
         }
@@ -443,38 +349,21 @@ export function compileToLuauVM(
           compileExpression(clause.condition, condReg);
           jmpNotIdx = emit('JMPIFNOT', condReg, 0, 0);
         }
-
-        for (const s of clause.body) {
-          compileStatement(s);
-        }
-
-        if (c < stmt.clauses.length - 1) {
-          exitJumps.push(emit('JMP', 0, 0, 0));
-        }
-
-        if (jmpNotIdx !== -1) {
-          rawInstructions[jmpNotIdx][2] = rawInstructions.length - jmpNotIdx - 1;
-        }
+        for (const s of clause.body) compileStatement(s);
+        if (c < stmt.clauses.length - 1) exitJumps.push(emit('JMP', 0, 0, 0));
+        if (jmpNotIdx !== -1) rawInstructions[jmpNotIdx][2] = rawInstructions.length - jmpNotIdx - 1;
       }
-
-      for (const ej of exitJumps) {
-        rawInstructions[ej][2] = rawInstructions.length - ej - 1;
-      }
+      for (const ej of exitJumps) rawInstructions[ej][2] = rawInstructions.length - ej - 1;
     } else if (stmt.type === 'WhileStatement') {
       const startPc = rawInstructions.length;
       const condReg = allocReg();
       compileExpression(stmt.condition, condReg);
       const jmpOut = emit('JMPIFNOT', condReg, 0, 0);
-
-      for (const s of stmt.body) {
-        compileStatement(s);
-      }
-
+      for (const s of stmt.body) compileStatement(s);
       const loopJmp = emit('JMP', 0, 0, 0);
       rawInstructions[loopJmp][2] = startPc - loopJmp - 1;
       rawInstructions[jmpOut][2] = rawInstructions.length - jmpOut - 1;
     } else if (stmt.type === 'ForNumericStatement') {
-      const varName = stmt.variable.name;
       const baseR = allocReg();
       compileExpression(stmt.start, baseR);
       const limitR = allocReg();
@@ -482,17 +371,11 @@ export function compileToLuauVM(
       const stepR = allocReg();
       if (stmt.step) compileExpression(stmt.step, stepR);
       else emit('LOADK', stepR, addNumConstant(1), 2);
-
       const extVarR = allocReg();
-      localRegs.set(varName, extVarR);
-
+      localRegs.set(stmt.variable.name, extVarR);
       const prepIdx = emit('FORPREP', baseR, 0, extVarR);
       const bodyStart = rawInstructions.length;
-
-      for (const s of stmt.body) {
-        compileStatement(s);
-      }
-
+      for (const s of stmt.body) compileStatement(s);
       const loopIdx = emit('FORLOOP', baseR, 0, extVarR);
       rawInstructions[prepIdx][2] = loopIdx - prepIdx;
       rawInstructions[loopIdx][2] = loopIdx - bodyStart + 1;
@@ -501,18 +384,12 @@ export function compileToLuauVM(
         const retReg = allocReg();
         compileExpression(stmt.arguments[0], retReg);
         emit('RETURN', retReg, 1, 0);
-      } else {
-        emit('RETURN', 0, 0, 0);
-      }
+      } else emit('RETURN', 0, 0, 0);
     } else if (stmt.type === 'DoStatement') {
-      for (const s of stmt.body) {
-        compileStatement(s);
-      }
+      for (const s of stmt.body) compileStatement(s);
     } else if (stmt.type === 'RepeatStatement') {
       const startPc = rawInstructions.length;
-      for (const s of stmt.body) {
-        compileStatement(s);
-      }
+      for (const s of stmt.body) compileStatement(s);
       const condReg = allocReg();
       compileExpression(stmt.condition, condReg);
       const repJmp = emit('JMPIFNOT', condReg, 0, 0);
@@ -520,17 +397,11 @@ export function compileToLuauVM(
     }
   }
 
-  for (const stmt of ast.body) {
-    compileStatement(stmt);
-  }
-
+  for (const stmt of ast.body) compileStatement(stmt);
   emit('RETURN', 0, 0, 0);
 
-  // 5. 128-Byte Nonce Buffer & HMAC-PBKDF Key Sub-Derivations
   const nonceBytes: number[] = [];
-  for (let i = 0; i < 128; i++) {
-    nonceBytes.push((lcgNext() >>> 0) % 256);
-  }
+  for (let i = 0; i < 128; i++) nonceBytes.push((lcgNext() >>> 0) % 256);
 
   const saltBytecode = (seed ^ 0x9e3779b9) % 256;
   const saltOp = (seed ^ 0x85ebca6b) % 256;
@@ -544,74 +415,51 @@ export function compileToLuauVM(
   const kdfMult4 = ([83, 89, 97, 101, 103])[lcgNext() % 5];
   const kdfMult5 = ([107, 109, 113, 127, 131])[lcgNext() % 5];
 
-  // Derive sub-keys at build time
   let k_bytecode = saltBytecode;
-  for (let round = 0; round < 4; round++) {
-    for (let i = 0; i < 24; i++) {
-      k_bytecode = ((k_bytecode * kdfMult1 + nonceBytes[i]) >>> 0) % 256;
-    }
-  }
+  for (let r = 0; r < 4; r++) for (let i = 0; i < 24; i++)
+    k_bytecode = ((k_bytecode * kdfMult1 + nonceBytes[i]) >>> 0) % 256;
 
   let k_op = saltOp;
-  for (let round = 0; round < 4; round++) {
-    for (let i = 24; i < 48; i++) {
-      k_op = ((k_op * kdfMult2 + nonceBytes[i]) >>> 0) % 256;
-    }
-  }
+  for (let r = 0; r < 4; r++) for (let i = 24; i < 48; i++)
+    k_op = ((k_op * kdfMult2 + nonceBytes[i]) >>> 0) % 256;
 
   let k_numConst = saltNum;
-  for (let round = 0; round < 4; round++) {
-    for (let i = 48; i < 72; i++) {
-      k_numConst = ((k_numConst * kdfMult3 + nonceBytes[i]) >>> 0) % 256;
-    }
-  }
+  for (let r = 0; r < 4; r++) for (let i = 48; i < 72; i++)
+    k_numConst = ((k_numConst * kdfMult3 + nonceBytes[i]) >>> 0) % 256;
 
   let k_strConst = saltStr;
-  for (let round = 0; round < 4; round++) {
-    for (let i = 72; i < 96; i++) {
-      k_strConst = ((k_strConst * kdfMult4 + nonceBytes[i]) >>> 0) % 256;
-    }
-  }
+  for (let r = 0; r < 4; r++) for (let i = 72; i < 96; i++)
+    k_strConst = ((k_strConst * kdfMult4 + nonceBytes[i]) >>> 0) % 256;
 
   let k_auth = saltAuth;
-  for (let round = 0; round < 4; round++) {
-    for (let i = 96; i < 120; i++) {
-      k_auth = ((k_auth * kdfMult5 + nonceBytes[i]) >>> 0) % 256;
-    }
-  }
+  for (let r = 0; r < 4; r++) for (let i = 96; i < 120; i++)
+    k_auth = ((k_auth * kdfMult5 + nonceBytes[i]) >>> 0) % 256;
 
   const dynStep = ([13, 17, 19, 23, 29, 31, 37])[lcgNext() % 7];
   const numStep = ([11, 13, 17, 19, 23])[lcgNext() % 5];
   const numAdd = (lcgNext() % 50) + 7;
   const strStep = ([23, 29, 31, 37, 41])[lcgNext() % 5];
 
-  // 6. Binary Serialization & Separated Pool Encoding
   const serializedBytes: number[] = [];
-
   const instCount = rawInstructions.length;
   serializedBytes.push((instCount >> 8) & 0xff, instCount & 0xff);
 
-  // Instructions Scrambled Layout
   for (let idx = 0; idx < rawInstructions.length; idx++) {
     const [op, a, b, c] = rawInstructions[idx];
     const pc = idx + 1;
     const dynKey = (k_op + pc * dynStep) % 256;
     const mutatedOp = (op ^ dynKey) & 0xff;
-
     const encA = a & 0xff;
     const encB = (b >= 0 ? b : 256 + (b % 256)) & 0xff;
     const encC = c & 0xff;
-
     const quad = [0, 0, 0, 0];
     quad[oPos] = mutatedOp;
     quad[aPos] = encA;
     quad[bPos] = encB;
     quad[cPos] = encC;
-
     serializedBytes.push(...quad);
   }
 
-  // Pool 1: Numeric Constants
   const numKCount = numConstants.length;
   serializedBytes.push((numKCount >> 8) & 0xff, numKCount & 0xff);
   for (const n of numConstants) {
@@ -623,7 +471,6 @@ export function compileToLuauVM(
     }
   }
 
-  // Pool 2: CBC-Style Chained String Constants
   const strKCount = strConstants.length;
   serializedBytes.push((strKCount >> 8) & 0xff, strKCount & 0xff);
   for (const s of strConstants) {
@@ -639,15 +486,11 @@ export function compileToLuauVM(
     }
   }
 
-  // Pool 3: Bitfield Bitmap Compressed Boolean Pool
   const boolKCount = boolConstants.length;
   serializedBytes.push((boolKCount >> 8) & 0xff, boolKCount & 0xff);
   let boolBitmap = 0;
-  for (let i = 0; i < boolConstants.length; i++) {
-    if (boolConstants[i]) {
-      boolBitmap |= (1 << (i % 30));
-    }
-  }
+  for (let i = 0; i < boolConstants.length; i++)
+    if (boolConstants[i]) boolBitmap |= (1 << (i % 30));
   const boolMask = (k_numConst * 257) % 0x3fffffff;
   const maskedBoolBitmap = (boolBitmap ^ boolMask) >>> 0;
   serializedBytes.push(
@@ -657,7 +500,6 @@ export function compileToLuauVM(
     maskedBoolBitmap & 0xff
   );
 
-  // Keyed HMAC Authentication Tag Computation (32-bit HMAC-Adler)
   let authA = k_auth + 1;
   let authB = (k_auth * 31) % 65521;
   for (let i = 0; i < serializedBytes.length; i++) {
@@ -665,7 +507,6 @@ export function compileToLuauVM(
     authB = (authB + authA * 19 + serializedBytes[i]) % 65521;
   }
 
-  // Poly-Alphabetic XAR Stream Encryption
   const sboxStep = ([17, 19, 23, 29, 31])[lcgNext() % 5];
   const lcgMult1 = (lcgNext() % 15) * 2 + 17;
   const lcgAdd1 = (lcgNext() % 20000) + 5001;
@@ -679,8 +520,7 @@ export function compileToLuauVM(
   }
 
   const encryptedPayloadBytes: number[] = [...nonceBytes];
-  let rc4I = 0;
-  let rc4J = 0;
+  let rc4I = 0, rc4J = 0;
   let lcgKey = (k_bytecode * 257) % 65536;
 
   for (let pos = 0; pos < serializedBytes.length; pos++) {
@@ -688,51 +528,23 @@ export function compileToLuauVM(
     rc4J = (rc4J + rc4S[rc4I]) % 256;
     [rc4S[rc4I], rc4S[rc4J]] = [rc4S[rc4J], rc4S[rc4I]];
     const rc4K = rc4S[(rc4S[rc4I] + rc4S[rc4J]) % 256];
-
     lcgKey = (lcgKey * lcgMult1 + lcgAdd1) % 65536;
     const lcgK = (lcgKey >>> 8) & 0xff;
-
     const encByte = (serializedBytes[pos] ^ rc4K ^ lcgK ^ ((pos * posStep) % 256)) & 0xff;
     encryptedPayloadBytes.push(encByte);
   }
 
-  // Chunk payload
-  const bzChunks: string[] = [];
-  const chunkSize = Math.max(32, Math.ceil(encryptedPayloadBytes.length / 6));
-  for (let i = 0; i < encryptedPayloadBytes.length; i += chunkSize) {
-    const slice = encryptedPayloadBytes.slice(i, i + chunkSize);
-    bzChunks.push(slice.map((b) => `\\${b.toString().padStart(3, '0')}`).join(''));
-  }
-  const formattedRawPayload = bzChunks.join('');
-
-  // Encrypted Parameter Array Construction
   const paramStep = (lcgNext() % 17) + 5;
   const paramMult = (lcgNext() % 7) + 3;
 
   const rawKParams = [
-    saltBytecode,               // 1
-    saltOp,                     // 2
-    saltNum,                    // 3
-    saltStr,                    // 4
-    saltAuth,                   // 5
-    kdfMult1,                   // 6
-    kdfMult2,                   // 7
-    kdfMult3,                   // 8
-    kdfMult4,                   // 9
-    kdfMult5,                   // 10
-    sboxStep,                   // 11
-    lcgMult1,                   // 12
-    (lcgAdd1 >> 8) & 0xff,      // 13
-    lcgAdd1 & 0xff,             // 14
-    posStep,                    // 15
-    (authA >> 8) & 0xff,        // 16
-    authA & 0xff,               // 17
-    (authB >> 8) & 0xff,        // 18
-    authB & 0xff,               // 19
-    numStep,                    // 20
-    numAdd,                     // 21
-    strStep,                    // 22
-    dynStep,                    // 23
+    saltBytecode, saltOp, saltNum, saltStr, saltAuth,
+    kdfMult1, kdfMult2, kdfMult3, kdfMult4, kdfMult5,
+    sboxStep, lcgMult1,
+    (lcgAdd1 >> 8) & 0xff, lcgAdd1 & 0xff, posStep,
+    (authA >> 8) & 0xff, authA & 0xff,
+    (authB >> 8) & 0xff, authB & 0xff,
+    numStep, numAdd, strStep, dynStep,
   ];
 
   const maskedKParams = rawKParams.map((val, idx) => {
@@ -741,7 +553,6 @@ export function compileToLuauVM(
     return (val ^ pMask) & 0xff;
   });
 
-  // Polymorphic Dynamic Double-Indirection Mapping for Handler Slots
   const slotLoadk = calcOpSlot(opMap.get('LOADK')!);
   const slotLoadnil = calcOpSlot(opMap.get('LOADNIL')!);
   const slotLoadbool = calcOpSlot(opMap.get('LOADBOOL')!);
@@ -779,43 +590,72 @@ export function compileToLuauVM(
   const slotForprep = calcOpSlot(opMap.get('FORPREP')!);
   const slotForloop = calcOpSlot(opMap.get('FORLOOP')!);
 
-  // Strict Whitelist Global Dictionary
   const customGlobals = Array.from(referencedGlobals)
     .filter((g) => g !== '_G' && g !== 'shared' && /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(g))
     .map((g) => `[${JSON.stringify(g)}] = true`)
     .join(', ');
 
-  // Payload Generation Strategy (Inline vs External Server Fetch)
-  const isExternal = Boolean(options.externalPayloadUrl && options.externalPayloadUrl.trim().length > 0);
-  const targetUrl = options.externalPayloadUrl ? options.externalPayloadUrl.trim() : '';
-
-  let bzInitializationCode = '';
-  if (isExternal) {
-    bzInitializationCode = `local function _fetchPayload(url)
+  // ═══════════════════════════════════════════════════════════════════
+  // [SECURITY CRITICAL] Session fetch prelude (external payload only)
+  // ═══════════════════════════════════════════════════════════════════
+  const bzInitializationCode = `
+local function _fetchSession(url)
     if type(game) == "userdata" or type(game) == "table" then
         if type(game.HttpGet) == "function" then
             local ok, res = pcall(game.HttpGet, game, url)
             if ok and type(res) == "string" and #res > 0 then return res end
         end
     end
-    if type(http_request) == "function" then
-        local ok, res = pcall(http_request, {Url = url, Method = "GET"})
-        if ok and type(res) == "table" and res.Body then return res.Body end
-    end
     if type(request) == "function" then
         local ok, res = pcall(request, {Url = url, Method = "GET"})
         if ok and type(res) == "table" and res.Body then return res.Body end
     end
-    error("Failed to fetch external VM payload from server: " .. tostring(url))
+    if type(http_request) == "function" then
+        local ok, res = pcall(http_request, {Url = url, Method = "GET"})
+        if ok and type(res) == "table" and res.Body then return res.Body end
+    end
+    if type(syn) == "table" and type(syn.request) == "function" then
+        local ok, res = pcall(syn.request, {Url = url, Method = "GET"})
+        if ok and type(res) == "table" and res.Body then return res.Body end
+    end
+    error("VM: Failed to fetch session payload from server")
 end
-local ${bzVar} = _fetchPayload("${targetUrl}")`;
-  } else {
-    bzInitializationCode = `local ${bzVar} = table.concat({
-    ${bzChunks.map((c) => `"${c}"`).join(',\n    ')}
-})`;
-  }
 
-  // Generate Control Flow Flattening (CFF) State IDs
+local function _hexToBytes(hex)
+    if type(hex) ~= "string" or #hex % 2 ~= 0 then
+        error("VM: Invalid hex string in session payload")
+    end
+    local bytes = {}
+    for i = 1, #hex, 2 do
+        bytes[#bytes + 1] = tonumber(string.sub(hex, i, i + 1), 16)
+    end
+    return bytes
+end
+
+local function _parseSession(raw)
+    if type(raw) ~= "string" or #raw < 10 then
+        error("VM: Session payload too short")
+    end
+    local version, kpHex, payloadHex, authAHex, authBHex =
+        string.match(raw, "^(V%d+):([%x]*):([%x]*):([%x]*):([%x]*)$")
+    if version ~= "V1" then
+        error("VM: Invalid session payload version")
+    end
+    return {
+        kp = _hexToBytes(kpHex),
+        payloadBytes = _hexToBytes(payloadHex),
+        authA = tonumber(authAHex, 16) or 0,
+        authB = tonumber(authBHex, 16) or 0,
+    }
+end
+
+local _session = _parseSession(_fetchSession("${fullSessionUrl}"))
+local ${bzVar} = _session.payloadBytes
+local ${kpVar} = _session.kp
+local _sessionExpA = _session.authA
+local _sessionExpB = _session.authB
+`;
+
   const st0 = (lcgNext() % 8000) + 1000;
   const st1 = (lcgNext() % 8000) + 9000;
   const st2 = (lcgNext() % 8000) + 17000;
@@ -823,47 +663,32 @@ local ${bzVar} = _fetchPayload("${targetUrl}")`;
   const st4 = (lcgNext() % 8000) + 33000;
   const stEnd = (lcgNext() % 8000) + 41000;
 
-  // CFF Jumbled State Block Dispatcher Generation for Key Derivation
   const kdfBlocks = [
-    {
-      id: st0,
-      code: `k_bc = (k_bc * m1 + payload:byte(i)) % 256
+    { id: st0, code: `k_bc = (k_bc * m1 + payload:byte(i)) % 256
             i = i + 1
             if i > 24 then
                 i = 25
                 _state = ${st1}
-            end`,
-    },
-    {
-      id: st1,
-      code: `k_op = (k_op * m2 + payload:byte(i)) % 256
+            end` },
+    { id: st1, code: `k_op = (k_op * m2 + payload:byte(i)) % 256
             i = i + 1
             if i > 48 then
                 i = 49
                 _state = ${st2}
-            end`,
-    },
-    {
-      id: st2,
-      code: `k_num = (k_num * m3 + payload:byte(i)) % 256
+            end` },
+    { id: st2, code: `k_num = (k_num * m3 + payload:byte(i)) % 256
             i = i + 1
             if i > 72 then
                 i = 73
                 _state = ${st3}
-            end`,
-    },
-    {
-      id: st3,
-      code: `k_str = (k_str * m4 + payload:byte(i)) % 256
+            end` },
+    { id: st3, code: `k_str = (k_str * m4 + payload:byte(i)) % 256
             i = i + 1
             if i > 96 then
                 i = 97
                 _state = ${st4}
-            end`,
-    },
-    {
-      id: st4,
-      code: `k_auth = (k_auth * m5 + payload:byte(i)) % 256
+            end` },
+    { id: st4, code: `k_auth = (k_auth * m5 + payload:byte(i)) % 256
             i = i + 1
             if i > 120 then
                 r = r + 1
@@ -873,21 +698,16 @@ local ${bzVar} = _fetchPayload("${targetUrl}")`;
                     i = 1
                     _state = ${st0}
                 end
-            end`,
-    },
+            end` },
   ];
 
-  // Shuffle CFF Blocks in emitted Lua code
   for (let i = kdfBlocks.length - 1; i > 0; i--) {
     const j = lcgNext() % (i + 1);
     [kdfBlocks[i], kdfBlocks[j]] = [kdfBlocks[j], kdfBlocks[i]];
   }
 
   const kdfCffCode = kdfBlocks
-    .map((b, idx) => {
-      const clause = idx === 0 ? 'if' : 'elseif';
-      return `${clause} _state == ${b.id} then\n            ${b.code}`;
-    })
+    .map((b, idx) => `${idx === 0 ? 'if' : 'elseif'} _state == ${b.id} then\n            ${b.code}`)
     .join('\n        ');
 
   const vmLoaderScript = `${bzInitializationCode}
@@ -904,14 +724,11 @@ local function _bxor(a, b)
     return r
 end
 
--- Anti-Static Encrypted Parameter Pool
-local ${kpVar} = { ${maskedKParams.join(', ')} }
 local function ${getPVar}(i)
     local mask = (i * ${paramStep} + #type(type) * ${paramMult}) % 256
     return _bxor(${kpVar}[i], mask)
 end
 
--- 1. Control Flow Flattened (CFF) Non-Linear State Machine KDF Generator
 local function _derive_keys(payload)
     local k_bc, k_op, k_num, k_str, k_auth = ${getPVar}(1), ${getPVar}(2), ${getPVar}(3), ${getPVar}(4), ${getPVar}(5)
     local m1, m2, m3, m4, m5 = ${getPVar}(6), ${getPVar}(7), ${getPVar}(8), ${getPVar}(9), ${getPVar}(10)
@@ -927,7 +744,6 @@ local function _derive_keys(payload)
     return k_bc, k_op, k_num, k_str, k_auth
 end
 
--- 2. Cryptographic Keyed HMAC Rolling Digest Authentication Verification
 ${fTableVar}[${slotAuthFn}] = function(decBytes, expA, expB, k_auth)
     local a, b = k_auth + 1, (k_auth * 31) % 65521
     local len = #decBytes
@@ -938,7 +754,6 @@ ${fTableVar}[${slotAuthFn}] = function(decBytes, expA, expB, k_auth)
     return a == expA and b == expB
 end
 
--- 3. RC4 State S-Box Generator
 ${fTableVar}[${slotSBoxFn}] = function(bz, k_bc)
     local s = {}
     local sStep = ${getPVar}(11)
@@ -951,7 +766,6 @@ ${fTableVar}[${slotSBoxFn}] = function(bz, k_bc)
     return s
 end
 
--- Poly-Alphabetic Payload Decryptor
 ${fTableVar}[${slotDecryptFn}] = function(bz, k_bc, s)
     local res = {}
     local len = #bz
@@ -976,42 +790,31 @@ ${fTableVar}[${slotDecryptFn}] = function(bz, k_bc, s)
     return res
 end
 
--- 4. Bounds-Checked Constant Pools & Instruction Deserializer
 ${fTableVar}[${slotDeserializerFn}] = function(decBytes, k_num, k_str)
     local pos = 1
     local decLen = #decBytes
     local numStep, numAdd, strStep = ${getPVar}(20), ${getPVar}(21), ${getPVar}(22)
 
     local function r8()
-        if pos > decLen then
-            error("Corrupted or truncated bytecode stream in VM deserializer")
-        end
+        if pos > decLen then error("Corrupted or truncated bytecode stream in VM deserializer") end
         local b = decBytes[pos]
         pos = pos + 1
         return b
     end
-
     local function r16()
-        if pos + 1 > decLen then
-            error("Corrupted or truncated bytecode stream in VM deserializer (r16)")
-        end
+        if pos + 1 > decLen then error("Corrupted or truncated bytecode stream in VM deserializer (r16)") end
         local h = r8()
         local l = r8()
         return h * 256 + l
     end
-
     local function r32()
-        if pos + 3 > decLen then
-            error("Corrupted or truncated bytecode stream in VM deserializer (r32)")
-        end
+        if pos + 3 > decLen then error("Corrupted or truncated bytecode stream in VM deserializer (r32)") end
         local b1, b2, b3, b4 = r8(), r8(), r8(), r8()
         return b1 * 16777216 + b2 * 65536 + b3 * 256 + b4
     end
     
     local numInst = r16()
-    if numInst > 50000 then
-        error("Bytecode instruction count exceeds maximum limit (50000)")
-    end
+    if numInst > 50000 then error("Bytecode instruction count exceeds maximum limit (50000)") end
 
     local insts = {}
     for i = 1, numInst do
@@ -1025,11 +828,8 @@ ${fTableVar}[${slotDeserializerFn}] = function(decBytes, k_num, k_str)
         insts[i] = {o, a, b, c}
     end
     
-    -- Sub-Pool 1: Numeric Constants
     local numNumK = r16()
-    if numNumK > 10000 then
-        error("Numeric constant count exceeds maximum limit (10000)")
-    end
+    if numNumK > 10000 then error("Numeric constant count exceeds maximum limit (10000)") end
     local numKs = {}
     for i = 1, numNumK do
         local nlen = r8()
@@ -1043,17 +843,12 @@ ${fTableVar}[${slotDeserializerFn}] = function(decBytes, k_num, k_str)
         numKs[i] = tonumber(table.concat(ns))
     end
 
-    -- Sub-Pool 2: CBC-Style Chained String Constants
     local numStrK = r16()
-    if numStrK > 10000 then
-        error("String constant count exceeds maximum limit (10000)")
-    end
+    if numStrK > 10000 then error("String constant count exceeds maximum limit (10000)") end
     local strKs = {}
     for i = 1, numStrK do
         local slen = r16()
-        if slen > 1000000 then
-            error("String constant length exceeds maximum limit (1MB)")
-        end
+        if slen > 1000000 then error("String constant length exceeds maximum limit (1MB)") end
         local ss = {}
         local cbcIv = k_str
         for p = 1, slen do
@@ -1066,11 +861,8 @@ ${fTableVar}[${slotDeserializerFn}] = function(decBytes, k_num, k_str)
         strKs[i] = table.concat(ss)
     end
 
-    -- Sub-Pool 3: Bitfield Compressed Boolean Constants
     local numBoolK = r16()
-    if numBoolK > 10000 then
-        error("Boolean constant count exceeds maximum limit (10000)")
-    end
+    if numBoolK > 10000 then error("Boolean constant count exceeds maximum limit (10000)") end
     local boolKs = {}
     local maskedBoolBitmap = r32()
     local boolMask = (k_num * 257) % 0x3fffffff
@@ -1084,12 +876,11 @@ ${fTableVar}[${slotDeserializerFn}] = function(decBytes, k_num, k_str)
     return insts, numKs, strKs, boolKs
 end
 
--- 5. Polymorphic Execution Engine & Variadic Multi-Return Interpreter Loop
 ${fTableVar}[${slotExecEngineFn}] = function(insts, numKs, strKs, boolKs, k_op)
     local ${stkVar} = {}
     local ${pcVar} = 1
     local ${cycleVar} = 0
-    local maxCycles = 10000000 -- Cycle quota limit
+    local maxCycles = 10000000
     local dynStep = ${getPVar}(23)
     
     local _pcall   = pcall
@@ -1121,44 +912,27 @@ ${fTableVar}[${slotExecEngineFn}] = function(insts, numKs, strKs, boolKs, k_op)
     }
 
     _mt.__index = function(_, key)
-        if key == "_G" or key == "shared" then
-            return prx
-        end
-        if not _whitelist[key] then
-            return nil
-        end
+        if key == "_G" or key == "shared" then return prx end
+        if not _whitelist[key] then return nil end
         local sbVal = _sandbox[key]
-        if sbVal ~= nil then
-            return sbVal
-        end
+        if sbVal ~= nil then return sbVal end
         local rVal = _rawget(_real_env, key)
-        if rVal ~= nil then
-            return rVal
-        end
+        if rVal ~= nil then return rVal end
         return _real_env[key]
     end
-
     _mt.__newindex = function(_, key, val)
-        if key == "_G" or key == "shared" then
-            return
-        end
-        if not _whitelist[key] then
-            _sandbox[key] = val
-            return
-        end
+        if key == "_G" or key == "shared" then return end
+        if not _whitelist[key] then _sandbox[key] = val; return end
         _rawset(_real_env, key, val)
     end
-
     _mt.__tostring = function() return "userdata: 0x0" end
     _mt.__metatable = false
 
     local prx = _px or _setmt({}, _mt)
     _sandbox["_G"] = prx
     _sandbox["shared"] = prx
-
     local unp = unpack or table.unpack
 
-    -- Bounds-Checked Constant Retrieval
     local function getK(idx, poolType)
         if poolType == 1 then
             if idx >= 1 and idx <= #boolKs then return boolKs[idx] end
@@ -1173,14 +947,12 @@ ${fTableVar}[${slotExecEngineFn}] = function(insts, numKs, strKs, boolKs, k_op)
         error("Invalid constant pool type: " .. tostring(poolType))
     end
 
-    -- Safe Jump Target Verification
     local function validateJump(target)
         if target < 1 or target > #insts then
             error("Invalid jump target PC out of bounds: " .. tostring(target))
         end
     end
 
-    -- Dynamic Polymorphic Handler Dispatcher
     local ${dTableVar} = {}
 
     ${dTableVar}[${slotLoadk}] = function(a, b, c) ${stkVar}[a] = getK(b, c) end
@@ -1217,19 +989,10 @@ ${fTableVar}[${slotExecEngineFn}] = function(insts, numKs, strKs, boolKs, k_op)
         if _type(fn) == "function" then
             local args = {}
             for idx = 1, b do args[idx] = ${stkVar}[a + idx] end
-            
-            -- Variadic Multi-Return tuple handling preserving nil gaps via select("#", ...)
-            local rets = (function(...)
-                return { n = _select("#", ...), ... }
-            end)(fn(unp(args, 1, b)))
-            
+            local rets = (function(...) return { n = _select("#", ...), ... } end)(fn(unp(args, 1, b)))
             local numRets = rets.n or 0
-            if c > 0 then
-                ${stkVar}[c] = (numRets > 0) and rets[1] or nil
-            end
-            for rIdx = 1, numRets do
-                ${stkVar}[a + rIdx - 1] = rets[rIdx]
-            end
+            if c > 0 then ${stkVar}[c] = (numRets > 0) and rets[1] or nil end
+            for rIdx = 1, numRets do ${stkVar}[a + rIdx - 1] = rets[rIdx] end
         else
             error("Attempt to call a non-function value in VM register A")
         end
@@ -1277,15 +1040,12 @@ ${fTableVar}[${slotExecEngineFn}] = function(insts, numKs, strKs, boolKs, k_op)
         return nil
     end
 
-    -- Polymorphic Indirect Dispatch Executor
     local function ${execOpVar}(realOp, a, b, c)
         local _slot = _bxor(((realOp * ${opHashMult} + ${opHashAdd}) % ${opHashMod}), ${opHashXor})
         local _handler = ${dTableVar}[_slot]
         if _handler then
             local ret = _handler(a, b, c)
-            if realOp == ${opMap.get('RETURN')!} then
-                return true, ret
-            end
+            if realOp == ${opMap.get('RETURN')!} then return true, ret end
             return false, nil
         end
         error("Invalid or unknown opcode execution attempt in VM: " .. tostring(realOp))
@@ -1302,10 +1062,7 @@ ${fTableVar}[${slotExecEngineFn}] = function(insts, numKs, strKs, boolKs, k_op)
         local _rawOp = _bxor(inst[1], _dynKey)
 
         local isRet, retVal = ${execOpVar}(_rawOp, inst[2], inst[3], inst[4])
-        if isRet then
-            return retVal
-        end
-
+        if isRet then return retVal end
         ${pcVar} = ${pcVar} + 1
     end
 end
@@ -1315,8 +1072,8 @@ local function ${gzVar}()
     local sTable = ${fTableVar}[${slotSBoxFn}](${bzVar}, k_bc)
     local dec = ${fTableVar}[${slotDecryptFn}](${bzVar}, k_bc, sTable)
     
-    local expA = ${getPVar}(16) * 256 + ${getPVar}(17)
-    local expB = ${getPVar}(18) * 256 + ${getPVar}(19)
+    local expA = _sessionExpA
+    local expB = _sessionExpB
     if not ${fTableVar}[${slotAuthFn}](dec, expA, expB, k_auth) then
         error("Bytecode authentication digest verification failed (tampered payload)")
     end
@@ -1336,7 +1093,11 @@ ${gzVar}()
     code: vmLoaderScript.trim(),
     instructionCount: rawInstructions.length,
     constantCount: numConstants.length + strConstants.length + boolConstants.length,
-    externalPayloadUrl: isExternal ? targetUrl : undefined,
-    rawPayload: formattedRawPayload,
+    sessionData: {
+      maskedKParams,
+      encryptedPayload: encryptedPayloadBytes,
+      authA,
+      authB,
+    },
   };
 }
